@@ -1,204 +1,69 @@
-$(function() {
-	var $videoContainer = $('#video-container');
-	var $audioPlayer = $('audio');
-	var $audioContainer = $('#audio-container');
-	var $previewImage = $('#preview-image');
-	var $playerLoading = $('#player-loading');
+class HlsVodToo extends Tonic {
+    render () {
+        const pathSectors = this.props.path.split('/').filter(_ => _);
+        const type = pathSectors.shift();
+        const legalPath = pathSectors.join('/');
+        switch (type) {
+            case 'video':
+                return this.html`<div>Feature not implemented</div>`;
+            case 'directory':
+                return this.html`<hls-vod-browse path="${legalPath}"></hls-vod-browse>`;
+            case 'audio':
+                // TODO
+            default:
+                // TODO
+        }
+        window.location.hash = '#/directory/';
+    }
 
-	// State
-	var mediaElement;
-	var loading = false;
-	var activeTranscodings = [];
+    connected() {
+        window.addEventListener('hashchange', this.hashChange);
+    }
 
-	function audioStop() {
-		$audioPlayer.prop('controls', false);
-		$audioPlayer[0].pause();
-		$audioContainer.hide();
-	}
+    disconnected() {
+        window.removeEventListener('hashchange', this.hashChange);
+    }
 
-	function videoStop() {
-		if (mediaElement) {
-			mediaElement.pause();
-			$videoContainer.hide();
-		}
-	}
+    constructor() {
+        super();
+        this.props.path = location.hash.substr(1);
+        this.hashChange = () => {
+            const path = location.hash.substr(1);
+            if (path !== this.props.path) {
+                this.reRender(() => ({ path }));
+            }
+        };
+    }
+}
 
-	function audioPlay(path, name) {
-		$('#audio-song-name').text(name);
+class HlsVodBrowse extends Tonic {
+    async * render() {
+        yield this.html`<div class="alert alert-info">Loading directory ${this.props.path}...</div>`;
+        let list;
+        try {
+            list = await (await fetch(`browse/${encodeURIComponent('/' + this.props.path)}`)).json();
+        } catch (e) {
+            return this.html`<div class="alert alert-danger">Failed to load directory content: ${e}</div>`;
+        }
+        const sections = this.props.path.split('/');
+        const pathPrefix = this.props.path ? (this.props.path + '/') : '';
+        return this.html`
+            <nav>
+                <ol class="breadcrumb">
+                    <li class="${'breadcrumb-item' + (this.props.path.length ? '' : ' active')}"><a href="#/directory/">Home</a></li>
+                    ${sections.map((section, index) => 
+                        this.html`<li class="${'breadcrumb-item' + ((index === sections.length - 1) ? ' active' : '')}"><a href="${'#/directory/' + encodeURI(sections.slice(0, index + 1).join('/'))}">${section}</a></li>`
+                    )}
+                </ol>
+            </nav>
+            <main>
+                <div class="list-group">
+                    ${list.map(file => this.html`<a class="list-group-item" href="${file.type ? `#/${file.type}/${encodeURI(pathPrefix + file.name)}` : '/raw/' + pathPrefix + file.name}">${file.name}</a>`)}
+                </div>
+            </main>
+        `;
+    }
+}
 
-		videoStop();
-		audioStop();
-		hidePreviewImage();
-
-		$audioPlayer.prop('controls', true);
-		$audioContainer.show();
-
-		$audioPlayer[0].src = path;
-		$audioPlayer[0].load();
-		$audioPlayer[0].play();
-	}
-
-	function videoPlay(path) {
-		audioStop();
-		hidePreviewImage();
-
-		$videoContainer.show();
-
-		if (mediaElement) {
-			mediaElement.pause();
-
-			mediaElement.setSrc(path);
-			mediaElement.play();
-		}
-		else {
-			var $video = $('#video');
-			$video[0].src = path;
-			$video.mediaelementplayer({
-				stretching: 'responsive',
-				success: function (mediaElement2, domObject) {
-			        mediaElement = mediaElement2;
-					mediaElement.play();
-			    },
-			    error: function (mediaeElement, err) {
-					console.log('Error loading media element');
-			    }
-			});
-		}
-	}
-
-	function hidePreviewImage() {
-		$playerLoading.fadeOut(200);
-		$previewImage.hide();
-	}
-
-	function showPreviewImage(relPath) {
-		var path = '/thumbnail' + relPath;
-		$previewImage.attr('src', path).fadeIn(200);
-		$playerLoading.fadeIn(200);
-		$previewImage.on('load', function() {
-			$playerLoading.fadeOut(200);
-		});
-		videoStop();
-		audioStop();
-	}
-
-	function updateActiveTranscodings() {
-		$('#transcoders').text('Active transcoders: ' + activeTranscodings.length).fadeIn(200);
-		setTimeout(function() {
-			$('#transcoders').fadeOut(200);
-		}, 5000);
-	}
-
-
-	function browseTo(path) {
-		if (loading) return;
-		loading = true;
-
-		var $fileList = $('#file-list');
-
-		$.ajax('/browse' + path, {
-			success: function(data) {
-				loading = false;
-
-				$('#dir-header').text(data.cwd);
-
-				$fileList.empty();
-
-				var back = $('<li/>');
-				back.html('..');
-				back.click(function() {
-					browseTo(data.cwd != '/' ? path + '/..' : path);
-				});
-				$fileList.append(back);
-
-				$.each(data.files, function(index, file) {
-					var elem = $('<li/>');
-					elem.text(file.name);
-
-					switch(file.type) {
-					case 'video':
-						elem.click(function() {
-							if (activeTranscodings.length == 0 || confirm('Play video? (Will delete any previous encoding)')) {
-								videoPlay(file.path);
-							}
-						});
-						break;
-
-					case 'audio':
-						elem.click(function() {
-							audioPlay(file.path, file.name);
-						});
-						break;
-
-					case 'directory':
-						elem.click(function() {
-							browseTo(file.path);
-						});
-						break;
-
-						default:
-					}
-
-					if (file.error) {
-						elem.attr('title', file.errorMsg);
-					}
-
-					if (file.type == 'video' || file.type == 'audio') {
-						var rawLink = $('<a style="color: inherit; margin-left: 1em; padding: 1em" />').attr('href', '/raw' + file.relPath).text('RAW');
-						rawLink.click(function(event) {
-							event.stopPropagation();
-						});
-						elem.append(rawLink);
-					}
-
-					if (file.type == 'video') {
-						var thumbLink = $('<span style="padding: 1em" />').text('Preview');
-						thumbLink.click(function(event) {
-							event.stopPropagation();
-							showPreviewImage(file.relPath);
-						});
-						elem.append(thumbLink);
-					}
-
-					$('#file-list').append(elem);
-				});
-			}
-		});
-	}
-
-
-	$('#settings-btn').click(function() {
-		$('#settings-container').fadeToggle();
-	});
-
-	$('#settings-container select[name=videoBitrate]').change(function() {
-		$.ajax('/settings', {
-			data: {
-				videoBitrate: $(this).val()
-			},
-			type: 'POST',
-			error: function() {
-				alert('Failed');
-			}
-		});
-	});
-
-	$.get('/settings', function(data) {
-		$('#settings-container select[name=videoBitrate]').val(data.videoBitrate);
-	});
-
-
-	var socket = io.connect();
-
-	socket.on('updateActiveTranscodings', function(data) {
-		activeTranscodings = data;
-		updateActiveTranscodings();
-	});
-
-	browseTo('/');
-
-	$videoContainer.hide();
-	$audioContainer.hide();
-	$previewImage.hide();
-	$playerLoading.hide();
-});
+Tonic.add(HlsVodBrowse);
+Tonic.add(HlsVodToo);

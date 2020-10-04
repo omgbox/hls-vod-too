@@ -7,7 +7,7 @@ import path = require('path');
 import os = require('os');
 import readline = require('readline');
 import crypto = require('crypto');
-import fs = require('fs/promises');
+import fs = require('fs');
 import events = require('events');
 import util = require('util');
 
@@ -17,6 +17,7 @@ import express = require('express');
 import serveStatic = require('serve-static');
 import parseArgs = require('minimist');
 import socketIo = require('socket.io');
+import { timeStamp } from 'console';
 
 if (typeof require('fs').Dirent !== 'function') {
     throw new Error(`The Node.js version is too old for ${__filename} to run.`);
@@ -45,25 +46,390 @@ const nativeSupportedFormats = {
     audio: ['aac', 'mp3', 'vorbis', 'opus', 'pcm_u8', 'pcm_s16le', 'pcm_f32le', 'flac']
 };
 
+class SubProcessInvocation {
+    public readonly promise: Promise<number>;
+    public readonly stdout: NonNullable<childProcess.ChildProcess['stdout']>;
+    private readonly process: childProcess.ChildProcess;
+
+    constructor(
+        command: string, 
+        args: string[],
+        cwd: string,
+        timeout: number
+    ) {
+        const processHandle = childProcess.spawn(
+            command,
+            args,
+            { cwd, env: process.env, stdio: ['pipe', 'pipe', 'inherit'] }
+        );
+        this.process = processHandle;
+        this.stdout = processHandle.stdout;
+
+        this.promise = new Promise((res, rej) => {
+            let timeoutRef: ReturnType<typeof setTimeout>;
+            const onFinish = (code: number) => {
+                clearTimeout(timeoutRef);
+                res(code);
+            };
+            processHandle.on('exit', onFinish);
+            timeoutRef = setTimeout(async () => {
+                processHandle.removeListener('exit', onFinish);
+                await SubProcessInvocation.killProcess(processHandle);
+                rej(new Error('Child process timeout.'));
+            }, timeout);
+        });
+    }
+
+    async result(): Promise<string> {
+        let stdoutBuf = '';
+        this.stdout.on('data', data => { 
+            stdoutBuf += data;
+        });
+        const code = await this.promise;
+        if (code != 0) { throw new Error(`Process ${this.process.pid} exited w/ status ${code}.`); }
+        return stdoutBuf;
+    };
+
+    get pid(): number { return this.process.pid; }
+
+    kill(): Promise<number> { return SubProcessInvocation.killProcess(this.process); }
+
+    private static killProcess(processToKill: childProcess.ChildProcess): Promise<number> {
+        return new Promise(res => {
+            processToKill.on('exit', res);
+            processToKill.kill();
+            setTimeout(() => processToKill.kill('SIGKILL'), 5000);
+        });
+    }
+}
+
 type QualityLevel = {
     name: string;
     preset: QualityLevelPreset;
     width: number;
     height: number;
-    segmentStatus: Uint8Array;
+    backend: MediaBackend | null;
 };
 
-class Media {
-    private static readonly DONE: number = 2;
+type TranscoderStatus = {
+    head: number;
+    id: number;
+};
 
-    private readonly qualityLevels: Map<string, QualityLevel>;
-    private readonly breakpoints: Float64Array;
+type ClientStatus = {
+    head: number;
+    transcoder?: SubProcessInvocation;
+    deleted?: boolean;
+}
+
+const EMPTY = 0; // 1 reserved.
+const DONE = 255; // 254 reserved.
+
+// A media with a specific quality level.
+class MediaBackend {
+    private readonly segmentStatus: Uint8Array;
+    private readonly encoderHeads: Map<SubProcessInvocation, TranscoderStatus> = new Map();
+    private readonly clients: Map<string, ClientStatus> = new Map();
     private readonly encodingDoneEmitter: events.EventEmitter = new events.EventEmitter();
 
-    private activeQualityLevel: QualityLevel | null = null;
-    private activeTranscoder: SubProcessInvocation | null = null;
-    private playhead: number = -1;
-    private encoderHead: number = -1;
+    private lastAssignedId: number = 1;
+
+    constructor(readonly parent: MediaInfo, readonly config: QualityLevel) {
+        this.segmentStatus = new Uint8Array(parent.breakpoints.length - 1); // Defaults to EMPTY.
+        this.segmentStatus.fill(EMPTY);
+    }
+    
+    // Range between [2, 253].
+    private findNextAvailableId(): number {
+        // Find the first usable one.
+        for (let i = -1; i <= 250; i++) {
+            const attempt = ((this.lastAssignedId + i) % 252) + 2;
+            if (this.segmentStatus.some(id => id === attempt)) {
+                continue;
+            }
+            if (Array.from(this.encoderHeads.values()).some(encoder => encoder.id === attempt)) {
+                continue;
+            }
+            return this.lastAssignedId = attempt;
+        }
+        throw new Error('No available Uint8 value.');
+    }
+
+    private startTranscode(startAt: number): SubProcessInvocation {
+        assert((startAt >= 0) && (startAt < this.parent.breakpoints.length - 1), 'Starting point wrong.');
+        assert(this.segmentStatus[startAt] === EMPTY, 'Segment already being encoded.');
+
+        let endAt = Math.min(this.parent.breakpoints.length - 1, startAt + 512); // By default, encode the entire video. However, clamp if there are too many (> 512), just to prevent the command from going overwhelmingly long.
+
+        for (let i = startAt + 1; i < this.parent.breakpoints.length - 1; i++) {
+            if (this.segmentStatus[i] !== EMPTY) {
+                endAt = i;
+                break;
+            }
+        }
+
+        const commaSeparatedTimes = this.parent.breakpoints.subarray(startAt + 1, endAt).join(',');
+
+        const transcoder = this.parent.parent.exec('ffmpeg', [
+            '-loglevel', 'warning',
+            '-ss', `${this.parent.breakpoints[startAt]}`, // Seek to start point. 
+            '-i', this.parent.parent.toDiskPath(this.parent.relPath), // Input file
+            '-to', `${this.parent.breakpoints[endAt]}`,
+            '-copyts', // So the "-to" refers to the original TS.
+            '-force_key_frames', commaSeparatedTimes,
+            '-vf', 'scale=' + ((this.config.width >= this.config.height) ? `-2:${this.config.height}` : `${this.config.width}:-2`), // Scaling
+            '-preset', 'faster',
+            '-sn', // No subtitles
+            // Video params:
+            '-c:v', 'libx264',
+            '-profile:v', 'high',
+            '-level:v', '4.0',
+            '-b:v', `${this.config.preset.videoBitrate}k`,
+            // Audio params:
+            '-c:a', 'aac',
+            '-b:a', `${this.config.preset.audioBitrate}k`,
+            // Segmenting specs:
+            '-f', 'segment',
+            '-segment_time_delta', '0.2',
+            '-segment_format', 'mpegts',
+            '-segment_times', commaSeparatedTimes,
+            '-segment_start_number', `${startAt}`,
+            '-segment_list_type', 'flat',
+            '-segment_list', 'pipe:1', // Output completed segments to stdout.
+            `${this.config.name}-%05d.ts`
+        ], { cwd: this.parent.outDir });
+
+        const encoderId = this.findNextAvailableId();
+        const status: TranscoderStatus = { head: startAt, id: encoderId };
+
+        this.segmentStatus[startAt] = encoderId;
+        this.encoderHeads.set(transcoder, status);
+
+        transcoder.promise.then(code => {
+            if ((code !== 0 /* Success */ && code !== 255 /* Terminated by us, likely */)) {
+                this.log(`FFmpeg process ${transcoder.pid} exited w/ status code ${code}.`);
+            }
+        }).finally(() => {
+            if (this.segmentStatus[status.head] === encoderId) {
+                this.segmentStatus[status.head] = EMPTY;
+            }
+            const deleted = this.encoderHeads.delete(transcoder);
+            assert(deleted, 'Transcoder already detached.');
+            this.recalculate();
+        });
+
+        readline.createInterface({
+            input: transcoder.stdout,
+        }).on('line', tsFileName => {
+            assert(tsFileName.startsWith(this.config.name + '-') && tsFileName.endsWith('.ts'), `Unexpected segment produced by ffmpeg: ${tsFileName}.`);
+            const index = parseInt(tsFileName.substring(this.config.name.length + 1, tsFileName.length - 3), 10);
+            if (index !== status.head) {
+                if (this.segmentStatus[status.head] === encoderId) {
+                    this.segmentStatus[status.head] = EMPTY;
+                }
+                this.log(`Unexpected segment produced by ffmpeg: index was ${index} while head was ${status.head}.`);
+            }
+            this.segmentStatus[index] = DONE;
+            this.encodingDoneEmitter.emit(`${index}`, null, tsFileName);
+            if (index >= endAt - 1) {
+                // Nothing specifically need to be done here. FFmpeg will exit automatically.
+            } else if (this.segmentStatus[index + 1] !== EMPTY) {
+                this.log(`Segment ${index} is not empty. Killing transcoder ${transcoder.pid}...`);
+                transcoder.kill();
+            } else {
+                let needToContinue = false;
+
+                this.clients.forEach(client => {
+                    if (client.transcoder !== transcoder) { return; }
+                    const playhead = client.head;
+                    const bufferedLength = this.parent.breakpoints[index + 1] - this.parent.breakpoints[playhead]; // Safe to assume all segments in between are encoded as long as the client is attached to this transcoder.
+                    if (bufferedLength < this.parent.parent.videoMaxBufferLength) {
+                        needToContinue = true;
+                    } else {
+                        this.log(`We've buffered to ${index}(${this.parent.breakpoints[index + 1]}), while the playhead is at ${playhead}(${this.parent.breakpoints[playhead]})`);
+                    }
+                })
+
+                if (needToContinue) {
+                    status.head = index + 1;
+                } else {
+                    this.parent.log('Stopping encoder as we have buffered enough.');
+                    transcoder.kill();
+                }
+            }
+        });
+
+        return transcoder;
+    }
+
+    private async recalculate(): Promise<void> {
+        type EncoderHeadInfoTuple = { process: SubProcessInvocation, clients: string[] };
+        type ClientHeadInfoTuple = { client: string; firstToEncode: number; bufferedLength: number; ref: ClientStatus; }
+
+        const killOperations = [];
+
+        // Map encoders from their heads.
+        const encoders: Map<number, EncoderHeadInfoTuple> = new Map();
+        for (const [process, { head: encoderHead }] of this.encoderHeads.entries()) {
+            if (encoders.has(encoderHead)) {
+                this.log(`Segment ${encoderHead} has two encoders (${process.pid} and ${encoders.get(encoderHead)!.process.pid}). This should never happen.`);
+                killOperations.push(process.kill()); // Intentionally not awaited to prevent race conditions (i.e. two callers call this method stimutnously).
+            } else {
+                encoders.set(encoderHead, { process, clients: [] });
+            }
+        }
+
+        // All playheads, sorted ascending.
+        const unresolvedPlayheads = (Array.from(this.clients.entries()).map(([client, value]): (ClientHeadInfoTuple | null) => {
+            if (value.deleted || value.head < 0) {
+                return null;
+            }
+            const segmentIndex = value.head;
+            // Traverse through all the segments within mandatory buffer range.
+            const startTime = this.parent.breakpoints[segmentIndex];
+            let shouldStartFromSegment = -1;
+            for (let i = segmentIndex; (i < this.parent.breakpoints.length - 1) && (this.parent.breakpoints[i] - startTime < this.parent.parent.videoMinBufferLength); i++) {
+                if (this.segmentStatus[i] !== DONE) {
+                    shouldStartFromSegment = i;
+                    break;
+                }
+            }
+            return (shouldStartFromSegment >= 0) ? { 
+                client,
+                firstToEncode: shouldStartFromSegment,
+                bufferedLength: shouldStartFromSegment - segmentIndex,
+                ref: value
+            } : null;
+        }).filter(_ => _) as ClientHeadInfoTuple[]).filter(playHead => {
+            const exactMatch = encoders.get(playHead.firstToEncode);
+            if (exactMatch) {
+                exactMatch.clients.push(playHead.client);
+                playHead.ref.transcoder = exactMatch.process;
+                return false;
+            }
+            const minusOneMatch = encoders.get(playHead.firstToEncode - 1);
+            if (minusOneMatch) {
+                minusOneMatch.clients.push(playHead.client);
+                playHead.ref.transcoder = minusOneMatch.process;
+                return false;
+            }
+            return true; // There isn't an existing encoder head for it yet!
+        }).sort((a, b) => a.firstToEncode - b.firstToEncode);
+        
+        // Kill all encoder heads that are unused.
+        for (const encoder of encoders.values()) {
+            if (!encoder.clients.length) {
+                killOperations.push(encoder.process.kill());
+            }
+        }
+
+        await Promise.all(killOperations);
+
+        let lastStartedProcess: { index: number, process: SubProcessInvocation } | null = null;
+        for (let i = 0; i < unresolvedPlayheads.length; i++) {
+            const current = unresolvedPlayheads[i];
+            if (lastStartedProcess && ((lastStartedProcess.index === current.firstToEncode) || (lastStartedProcess.index === current.firstToEncode - 1))) {
+                current.ref.transcoder = lastStartedProcess.process;
+                continue;
+            }
+            const process = this.startTranscode(current.firstToEncode);
+            current.ref.transcoder = process;
+            lastStartedProcess = { index: current.firstToEncode, process };
+        }        
+    }
+
+    private async onGetSegment(clientInfo: ClientStatus, segmentIndex: number): Promise<void> {
+        clientInfo.head = segmentIndex;
+
+        await this.recalculate();
+    }
+
+    getVariantManifest(): string {
+        const breakpoints = this.parent.breakpoints;
+        const qualityLevelName = this.config.name;
+        const segments = new Array((breakpoints.length - 1) * 2);
+        for (let i = 1; i < breakpoints.length; i++) {
+            segments[i * 2 - 2] = '#EXTINF:' + (breakpoints[i] - breakpoints[i - 1]).toFixed(3);
+            segments[i * 2 - 1] = `${qualityLevelName}.${i.toString(16)}.ts`;
+        }
+        return [
+            '#EXTM3U',
+            '#EXT-X-PLAYLIST-TYPE:VOD',
+            '#EXT-X-TARGETDURATION:4.75',
+            '#EXT-X-VERSION:4',
+            '#EXT-X-MEDIA-SEQUENCE:0', // I have no idea why this is needed.
+            ...segments,
+            '#EXT-X-ENDLIST'
+        ].join(os.EOL);
+    }
+
+    getSegment(clientId: string, segmentNumber: string, request: express.Request, response: express.Response): void {
+        let clientInfo = this.clients.get(clientId);
+        if (!clientInfo) {
+            clientInfo = { head: -1 };
+            this.clients.set(clientId, clientInfo);
+        } else if (clientInfo.deleted) {
+            response.sendStatus(409);
+            return;
+        }
+
+        const segmentIndex = parseInt(segmentNumber, 16) - 1;
+        assert(!isNaN(segmentIndex) && (segmentIndex >= 0) && (segmentIndex < this.parent.breakpoints.length - 1), `Segment index out of range.`);
+
+        const fileReady = this.segmentStatus[segmentIndex] === DONE;
+        this.onGetSegment(clientInfo, segmentIndex);
+
+        if (fileReady) {
+            const fileName = `${this.config.name}-${((segmentIndex + 1e5) % 1e6).toString().substr(1)}.ts`;
+            const filePath = path.join(this.parent.outDir, fileName);
+            response.sendFile(filePath);
+            return;
+        }
+
+        const callback = (errorInfo: string, fileName: string) => (errorInfo ? response.status(500).send(errorInfo) : response.sendFile(path.join(this.parent.outDir, fileName)));
+        this.encodingDoneEmitter.once(`${segmentIndex}`, callback);
+        request.on('close', () => this.encodingDoneEmitter.removeListener(`${segmentIndex}`, callback));
+    }
+
+    async removeClient(clientId: string) {
+        this.log(`Removing client ${clientId}.`);
+        const status = this.clients.get(clientId);
+        if (status?.deleted) {
+            return;
+        }
+
+        if (status) {
+            status.deleted = true;
+        } else {
+            // Prevent race condition such that [removeClient()] is called right after another request grabs the backend but not started using it.
+            this.clients.set(clientId, { head: -1, deleted: true });
+        }
+
+        await this.recalculate();
+
+        setTimeout(() => {
+            this.clients.delete(clientId); // The entry must not have been changed. A 1-seconds delay is enough to remove the possibility of race conditions.
+        }, 1000);
+    }
+
+    async destruct(): Promise<void> {
+        this.parent.parent.noticeDestructOfBackend(this, Array.from(this.clients.keys()));
+        for (const name of this.encodingDoneEmitter.eventNames()) {
+            this.encodingDoneEmitter.emit(name, 'Encoder being evicted.', null);
+        }
+        for (const subProcess of this.encoderHeads.keys()) {
+            await subProcess.kill();
+        }
+    }
+
+    log(...params: any): void {
+        this.parent.log(`[${this.config.name}]`, ...params);
+    }
+}
+
+class MediaInfo {
+    private readonly qualityLevels: Map<string, QualityLevel>;
+    readonly breakpoints: Float64Array;
 
     private constructor(
         readonly parent: HlsVod, 
@@ -75,9 +441,9 @@ class Media {
 		const { width, height, duration } = ffprobeOutput['streams'][0];
 		
 		const resolution = Math.min(width, height);
-        const validIFrames = ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter(time => !isNaN(time));
+        const validIFrames = ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter((time: number) => !isNaN(time));
         
-		this.breakpoints = Media.convertToSegments(validIFrames, duration);
+		this.breakpoints = MediaInfo.convertToSegments(validIFrames, duration);
 		
         this.qualityLevels = new Map(Object.entries(qualityLevelPresets).filter(([_, preset]) => preset.resolution <= resolution).map(([name, preset]) => 
             [name, {
@@ -85,7 +451,7 @@ class Media {
                 preset,
                 width: Math.round(width / resolution * preset.resolution),
                 height: Math.round(height / resolution * preset.resolution),
-                segmentStatus: new Uint8Array(this.breakpoints.length - 1)
+                backend: null
             }]
         )); 
 
@@ -95,8 +461,8 @@ class Media {
     public static async getInstance(
         parent: HlsVod, 
         relPath: string
-    ): Promise<Media> {
-        const ffprobeOutput = await (new parent.SubProcessInvocation('ffprobe', [
+    ): Promise<MediaInfo> {
+        const ffprobeOutput = await (parent.exec('ffprobe', [
 			'-v', 'error', // Hide debug information
 			'-show_streams', // Show video dimensions
 			'-skip_frame', 'nokey', '-show_entries', 'frame=pkt_pts_time', // List all I frames
@@ -107,190 +473,28 @@ class Media {
         
 		const pathHash = crypto.createHash('md5').update(parent.toDiskPath(relPath)).digest('hex');
         const outDir = path.join(parent.outputPath, pathHash);
-        await fsExtra.mkdirp(outDir);
+        await fsExtra.mkdirs(outDir);
 
-        return new Media(parent, relPath, outDir, ffprobeOutput);
+        return new MediaInfo(parent, relPath, outDir, ffprobeOutput);
     }
 
     getMasterManifest(): string {
         return ['#EXTM3U'].concat(
             ...Array.from(this.qualityLevels.entries()).map(([levelName, { width, height, preset }]) => [
                 `#EXT-X-STREAM-INF:BANDWIDTH=${
-                    (preset.videoBitrate + preset.audioBitrate) * 1.05 // 5% estimated container overhead.
+                    Math.ceil((preset.videoBitrate + preset.audioBitrate) * 1.05) // 5% estimated container overhead.
                 },RESOLUTION=${width}x${height}`,
                 `quality-${levelName}.m3u8`
             ])
         ).join(os.EOL)
-    };
+    }
     
-    getVariantManifest(qualityLevelName: string): string {
-        const segments = new Array((this.breakpoints.length - 1) * 2);
-        for (let i = 1; i < this.breakpoints.length; i++) {
-            segments[i * 2 - 2] = '#EXTINF:' + (this.breakpoints[i] - this.breakpoints[i - 1]).toFixed(3);
-            segments[i * 2 - 1] = `${qualityLevelName}-${i.toString(16)}.ts`;
-        }
-        return [
-            '#EXTM3U',
-            '#EXT-X-PLAYLIST-TYPE:VOD',
-            '#EXT-X-TARGETDURATION:4.75',
-            '#EXT-X-VERSION:4',
-            '#EXT-X-MEDIA-SEQUENCE:0', // I have no idea why this is needed.
-            ...segments,
-            '#EXT-X-ENDLIST'
-        ].join(os.EOL);
-    };
-
-    private startTranscode(startAt: number): void {
-        assert.strictEqual(this.activeTranscoder, null, 'There is another transcoder being active.');
-        const level = this.activeQualityLevel;
-        assert(level && (startAt >= 0) && (startAt < this.breakpoints.length - 1), "Starting point wrong.");
-
-        const endAt = Math.min(this.breakpoints.length - 1, startAt + 512); // By default, encode the entire video. However, clamp if there are too many (> 512), just to prevent the command from going overwhelmingly long.
-
-        const commaSeparatedTimes = this.breakpoints.subarray(startAt + 1, endAt).join(',');
-
-        const transcoder = new this.parent.SubProcessInvocation('ffmpeg', [
-            '-loglevel', 'warning',
-            '-ss', `${this.breakpoints[startAt]}`, // Seek to start point. 
-            '-i', this.parent.toDiskPath(this.relPath), // Input file
-            '-to', `${this.breakpoints[endAt]}`,
-            '-copyts', // So the "-to" refers to the original TS.
-            '-force_key_frames', commaSeparatedTimes,
-            '-vf', 'scale=' + ((level.width >= level.height) ? `-2:${level.height}` : `${level.width}:-2`), // Scaling
-            '-preset', 'faster',
-            '-sn', // No subtitles
-            // Video params:
-            '-c:v', 'libx264',
-            '-profile:v', 'high',
-            '-level:v', '4.0',
-            '-b:v', `${level.preset.videoBitrate}k`,
-            // Audio params:
-            '-c:a', 'aac',
-            '-b:a', `${level.preset.audioBitrate}k`,
-            // Segmenting specs:
-            '-f', 'segment',
-            '-segment_time_delta', '0.2',
-            '-segment_format', 'mpegts',
-            '-segment_times', commaSeparatedTimes,
-            '-segment_start_number', `${startAt}`,
-            '-segment_list_type', 'flat',
-            '-segment_list', 'pipe:1', // Output completed segments to stdout.
-            `${level.name}-%05d.ts`
-        ], { cwd: this.outDir });
-
-        this.activeTranscoder = transcoder;
-        this.encoderHead = startAt;
-
-        const promise = transcoder.promise.then(code => {
-            if ((code !== 0 /* Success */ && code !== 255 /* Terminated by us, likely */)) {
-                // Likely an uncoverable error. No need to restart. Tell clients to fail.
-                for (const name of this.encodingDoneEmitter.eventNames()) {
-                    this.encodingDoneEmitter.emit(name, `Ffmpeg exited w/ status code ${code}.`);
-                }
-            }
-        }).finally(() => {
-            assert.strictEqual(transcoder, this.activeTranscoder, 'Transcoder already detached.');
-            this.activeTranscoder = null;
-            this.encoderHead = -1;
-        });
-
-        readline.createInterface({
-            input: transcoder.stdout,
-        }).on('line', tsFileName => {
-            if (!(tsFileName.startsWith(level.name + '-') && tsFileName.endsWith('.ts'))) {
-                throw new RangeError(`Cannot parse name ${tsFileName} from ffmpeg.`);
-            }
-            const index = parseInt(tsFileName.substring(level.name.length + 1, tsFileName.length - 3), 10);
-            level.segmentStatus[index] = Media.DONE;
-            this.encodingDoneEmitter.emit(tsFileName, null);
-            if (index >= endAt - 1) {
-                // Nothing specifically need to be done here. Graceful shutdown will be done by transcoder.promise.then(...).
-                if (endAt < this.breakpoints.length - 1) {
-                    // Whole video not finished yet.
-                    promise.then(() => this.restartIfNeeded('partially finished'));
-                }
-            } else {
-                const bufferedLength = this.breakpoints[index + 1] - this.breakpoints[this.playhead];
-                if (bufferedLength > this.parent.videoMaxBufferLength) {
-                    // Terminate as we've buffered enough.
-                    this.log(`Terminating ffmpeg as we've buffered to ${index}(${this.breakpoints[index + 1]}), while the playhead is at ${this.playhead}(${this.breakpoints[this.playhead]})`);
-                    transcoder.kill();
-                } else {
-                    // Keep it running.
-                    this.encoderHead = index + 1;
-                }
-            }
-        });
+    level(qualityLevel: string): MediaBackend {
+        const level = this.qualityLevels.get(qualityLevel);
+        assert(level, 'Quality level not exists.');
+        if (!level.backend) { level.backend = new MediaBackend(this, level); }
+        return level.backend;
     }
-
-    private async restartIfNeeded(reason: string): Promise<void> {
-        if (this.activeTranscoder) {
-            await this.activeTranscoder.kill();
-        }
-        // TODO(kmxz)
-        this.log(`Starting ffmpeg (${reason}).`);
-    }
-
-    private async onGetSegment(qualityLevelObj: QualityLevel, segmentIndex: number) {
-        this.playhead = segmentIndex;
-
-        if (qualityLevelObj !== this.activeQualityLevel) {
-            this.activeQualityLevel = qualityLevelObj;
-            await this.restartIfNeeded('quality change');
-            return; // restartIfNeeded will be called anyway. No need to continue in this method.
-        }
-
-        // Traverse through all the segments within mandatory buffer range.
-        const startTime = this.breakpoints[segmentIndex];
-        let shouldStartFromSegment = -1;
-        for (let i = segmentIndex; (i < this.breakpoints.length - 1) && (this.breakpoints[i] - startTime < this.parent.videoMinBufferLength); i++) {
-            if (qualityLevelObj.segmentStatus[i] !== Media.DONE) {
-                shouldStartFromSegment = i;
-                break;
-            }
-        }
-        if (shouldStartFromSegment >= 0) {
-            if (this.activeTranscoder) {
-                if (this.encoderHead < segmentIndex - 1) {
-                    await this.restartIfNeeded('fast forward');
-                } else if (this.encoderHead > shouldStartFromSegment) {
-                    await this.restartIfNeeded('rewind');
-                } else {
-                    // All good. We're soon to be there. Just be a bit patient...
-                    return;
-                }
-            } else {
-                await this.restartIfNeeded('warm start');
-            }
-        }
-    };
-
-    getSegment(httpPath: string, request: express.Request, response: express.Response): void {
-        const [_, qualityLevelName, segmentNumber] = httpPath.match(/^(.+)-([0-9a-f]+)$/)!;
-        const level = this.qualityLevels.get(qualityLevelName);
-        assert(level, `Quality level ${qualityLevelName} not exists.`);
-        const segmentIndex = parseInt(segmentNumber, 16) - 1;
-        assert((segmentIndex >= 0) && (segmentIndex < this.breakpoints.length - 1), `Segment index out of range.`);
-        const fileName = `${qualityLevelName}-${((segmentIndex + 1e5) % 1e6).toString().substr(1)}.ts`;
-        const filePath = path.join(this.outDir, fileName);
-
-        const fileReady = level.segmentStatus[segmentIndex - 1] === Media.DONE;
-        this.onGetSegment(level, segmentIndex);
-
-        if (fileReady) {
-            response.sendFile(filePath);
-            return;
-        } 
-        const callback = (errStr: string) => {
-            if (errStr) {
-                response.status(500).send(errStr);
-            } else {
-                response.sendFile(filePath);
-            }
-        };
-        this.encodingDoneEmitter.once(fileName, callback);
-        request.on('close', () => this.encodingDoneEmitter.removeListener(fileName, callback));
-    };
 
     /**
 	 * Calculate the timestamps to segment the video at. 
@@ -334,53 +538,79 @@ class Media {
 		}
 		segmentStartTimes.push(duration);
 		return Float64Array.from(segmentStartTimes);
-    };
+    }
 
     async destruct() {
         // Caller should ensure that the instance is already initialized.
-        if (this.activeTranscoder) {
-            await this.activeTranscoder.kill();
+        for (const level of this.qualityLevels.values()) {
+            await level.backend?.destruct();
         }
         await fsExtra.remove(this.outDir);
-    };
+    }
     
-    private log(...params: any): void {
+    log(...params: any): void {
         if (this.parent.debug) {
             console.log(`[${this.relPath}]`, ...params);
         }
-    };
+    }
 }
 
-class MediaInfoCache {
-    private readonly cache: Map<String, Promise<Media>> = new Map();
+/**
+ * LRU cache map that handles async constructing/destructing:
+ * - If constructing/destructing is already in progress, not firing once again.
+ * - Ensures a previous cached value of the same key is properly destructed before constructing it again (to prevent external race conditions).
+ */
+class LruCacheMapForAsync<K, V, D = unknown> {
+    private readonly cache: Map<K, Promise<V>> = new Map();
+    private readonly destructions: Map<K, Promise<D>> = new Map();
 
-    constructor(private readonly parent: HlsVod, private readonly cacheSize: number) {}
-    
-    private async set(relPath: string, info: Promise<Media>): Promise<void> {
+    constructor(
+        private readonly cacheSize: number,
+        private readonly asyncConstructor: (key: K) => Promise<V>,
+        private readonly asyncDestructor: (instance: V, key: K) => Promise<D>
+    ) {}
+
+    private set(key: K, info: Promise<V>): void {
         if (this.cache.size >= this.cacheSize) { // Evict the first entry from the cache.
-            const [keytoEvict, info] = this.cache.entries().next().value;
-            await (await info).destruct();
-            this.cache.delete(keytoEvict);
+            this.delete(this.cache.keys().next().value); // No need to wait for it to finish. We can afford some temporary extra memory.
         }
-        this.cache.delete(relPath);
-        this.cache.set(relPath, info);
+        this.cache.set(key, info);
+    }
+
+    delete(key: K): Promise<D> | undefined {
+        const info = this.cache.get(key);
+        if (!info) {
+            return this.destructions.get(key);
+        }
+        const destruction = info.then((info) => this.asyncDestructor(info, key));
+        // It must NOT be in [this.destructions] yet, since it's in [this.cache].
+        this.cache.delete(key);
+        this.destructions.set(key, destruction);
+        return destruction;
     }
     
-    async get(relPath: string): Promise<Media> {
-        let info = this.cache.get(relPath);
+    get(key: K): Promise<V> {
+        let info = this.cache.get(key);
         if (!info) {
-            info = Media.getInstance(this.parent, relPath);
-            await this.set(relPath, info);
-            info.catch(e => this.cache.delete(e));
+            const destruction = this.destructions.get(key);
+            const ctor = () => this.asyncConstructor(key);
+            info = destruction ? destruction.then(ctor, ctor) : ctor();
+            this.set(key, info);
+            info.catch(() => {
+                if (this.cache.get(key) === info) { // This check is necessary as the item can be removed and re-added before info resolves.
+                    this.cache.delete(key);
+                }
+            });
         } else {
-            this.cache.delete(relPath); // Remove it from the original position in the cache and let the "set()" below put it to the end. This is needed as we want the cache to be an LRU one.
+            this.cache.delete(key); // Remove it from the original position in the cache and let the "set()" below put it to the end. This is needed as we want the cache to be an LRU one.
         }
-        this.cache.set(relPath, info);
-        return await info;
+        this.cache.set(key, info);
+        return info;
     }
+
 }
 
-type FileEntry = { type: 'video' | 'audio' | 'directory'; name: string; };
+type FileEntry = { type?: 'video' | 'audio' | 'directory'; name: string; };
 
 /**
  * Main entry point for a program instance. You can run multiple instances as long as they use different ports and output paths.
@@ -389,101 +619,97 @@ type FileEntry = { type: 'video' | 'audio' | 'directory'; name: string; };
  */
 class HlsVod {
 
-    public readonly SubProcessInvocation = class SubProcessInvocation {
-        static parent: HlsVod;
-        private static readonly allSubProcesses: Set<childProcess.ChildProcess> = new Set();
-
-        public readonly promise: Promise<number>;
-        public readonly stdout: NonNullable<childProcess.ChildProcess['stdout']>;
-        private readonly process: childProcess.ChildProcess;
-
-        constructor(
-            command: string, 
-            args: string[],
-            { timeout, cwd } : { timeout?: number, cwd?: string } = {}
-        ) {
-            const processHandle = childProcess.spawn(
-                SubProcessInvocation.parent.ffmpegBinaryDir + command,
-                args,
-                { cwd: cwd || SubProcessInvocation.parent.outputPath, env: process.env, stdio: ['pipe', 'pipe', 'inherit'] }
-            );
-            SubProcessInvocation.allSubProcesses.add(processHandle);
-            process.on('exit', () => SubProcessInvocation.allSubProcesses.delete(processHandle));
-            this.process = processHandle;
-            this.stdout = processHandle.stdout;
-
-            this.promise = new Promise((res, rej) => {
-                let timeoutRef: ReturnType<typeof setTimeout>;
-                const onFinish = (code: number) => {
-                    clearTimeout(timeoutRef);
-                    res(code);
-                };
-                processHandle.on('exit', onFinish);
-                timeoutRef = setTimeout(async () => {
-                    processHandle.removeListener('exit', onFinish);
-                    await SubProcessInvocation.killProcess(processHandle);
-                    rej(new Error('Child process timeout.'));
-                }, timeout || processCleanupTimeout);
-            });
-        }
-
-        public async result(): Promise<string> {
-            let stdoutBuf = '';
-            this.stdout.on('data', data => { 
-                stdoutBuf += data;
-            });
-            const code = await this.promise;
-            if (code != 0) { throw new Error(`Process ${this.process.pid} exited w/ status ${code}.`); }
-            return stdoutBuf;
-        };
-
-        public kill(): Promise<number> { return SubProcessInvocation.killProcess(this.process); }
-
-        public static killAll(): Promise<unknown> { return Promise.all(Array.from(SubProcessInvocation.allSubProcesses).map(SubProcessInvocation.killProcess)); }
-
-        private static killProcess(processToKill: childProcess.ChildProcess): Promise<number> {
-            return new Promise(res => {
-                processToKill.on('exit', res);
-                processToKill.kill();
-                setTimeout(() => processToKill.kill('SIGKILL'), 5000);
-            });
-        }
-    }
-
     readonly ffmpegBinaryDir: string;
     readonly outputPath: string;
     readonly debug: boolean;
+    readonly noShortCircuit: boolean;
     readonly videoMinBufferLength: number;
     readonly videoMaxBufferLength: number;
-    readonly server: http.Server = this.initExpress();
-
+    readonly server: http.Server;
+    readonly allSubProcesses: Set<SubProcessInvocation> = new Set();
+    
     private readonly listenPort: number;
     private readonly rootPath: string;
-    private readonly cachedMedia = new MediaInfoCache(this, 10);
+    private readonly maxClientNumber: number;
+    private readonly cachedMedia = new LruCacheMapForAsync<string, MediaInfo>(
+        Math.max(20), 
+        relPath => MediaInfo.getInstance(this, relPath),
+        info => info.destruct()
+    );
+    private readonly clientTracker: Map<string, Promise<MediaBackend>> = new Map();
 
     constructor(params: { [s: string]: any; }) {
-        this.SubProcessInvocation.parent = this;
-
         this.listenPort = parseInt(params['port']) || 4040;
         this.rootPath = path.resolve(params['root-path'] || '.');
         this.ffmpegBinaryDir = params['ffmpeg-binary-dir'] ? (params['ffmpeg-binary-dir'] + path.sep) : '';
         this.outputPath = path.resolve(params['cache-path'] || path.join(os.tmpdir(), 'hls-vod-cache'));
-        this.debug = params['debug'];
+        this.debug = !!params['debug'];
+        this.noShortCircuit = !!params['no-short-circuit'];
         this.videoMinBufferLength = parseInt(params['buffer-length']) || 30;
         this.videoMaxBufferLength = this.videoMinBufferLength * 2;
+        this.maxClientNumber = parseInt(params['max-client-number']) || 5;
+
+        this.server = this.initExpress();
+    }
+
+    public exec(
+        command: string, 
+        args: string[],
+        { timeout, cwd } : { timeout?: number, cwd?: string } = {}
+    ): SubProcessInvocation {
+        const handle = new SubProcessInvocation(this.ffmpegBinaryDir + command, args, cwd || this.outputPath, timeout || processCleanupTimeout);
+        this.allSubProcesses.add(handle);
+        handle.promise.finally(() => this.allSubProcesses.delete(handle));
+        return handle;
     }
 
     public toDiskPath(relPath: string): string {
         return path.join(this.rootPath, path.join('/', relPath));
     }
+
+    public async noticeDestructOfBackend(variant: MediaBackend, clients: string[]): Promise<unknown> {
+        // The is highly unlikely to be called. It will only happen when a [MediaInfo] is evicted from [cachedMedia], but its client is still in [clientTracker]. Usually [cachedMedia] should have a size larger than [maxClientNumber].
+        return Promise.all(clients.map(async client => {
+            const current = await this.clientTracker.get(client);
+            assert.strictEqual(current, variant, 'Backend mismatch.');
+            this.clientTracker.delete(client); // The backend is already going away. No need to call its [removeClient].
+        }));
+    }
+
+    private getBackend(clientId: string, file: string, qualityLevel: string): Promise<MediaBackend> {
+        const existing = this.clientTracker.get(clientId);
+        if (!existing) { // New client.
+            if (this.clientTracker.size > this.maxClientNumber) {
+                const [victimKey, victimValue] = this.clientTracker.entries().next().value;
+                this.clientTracker.delete(victimKey);
+                victimValue.removeClient(clientId);
+            }
+        } else {
+            existing.then(backend => {
+                if (backend.config.name !== qualityLevel || backend.parent.relPath !== file) {
+                    backend.removeClient(clientId);
+                }
+            });
+            this.clientTracker.delete(clientId);
+        }
+        const newLookupPromise = this.cachedMedia.get(file).then(instance => instance.level(qualityLevel));
+        this.clientTracker.set(clientId, newLookupPromise);
+        return newLookupPromise;
+    }
+
+    private async removeClient(clientId: string): Promise<void> {
+        const existing = this.clientTracker.get(clientId);
+        if (!existing) { return; }
+        existing.then(backend => backend.removeClient(clientId));
+        this.clientTracker.delete(clientId);
+    }
     
     private async browseDir(browsePath: string): Promise<FileEntry[]> {
         const diskPath = this.toDiskPath(browsePath);
 
-        const files = await fs.readdir(diskPath, { withFileTypes: true });
+        const files = await fs.promises.readdir(diskPath, { withFileTypes: true });
         const fileList = files.map(dirent => {
-            const fileObj: Partial<FileEntry> = {};
-            fileObj.name = dirent.name;
+            const fileObj: FileEntry = { name: dirent.name };
             if (dirent.isFile()) {
                 const extName = path.extname(dirent.name).toLowerCase();
                 if (videoExtensions.includes(extName)) {
@@ -494,7 +720,7 @@ class HlsVod {
             } else if (dirent.isDirectory()) {
                 fileObj.type = 'directory';
             }
-            return fileObj as FileEntry;
+            return fileObj;
         });
         return fileList;
     }
@@ -509,7 +735,7 @@ class HlsVod {
 
         if (this.debug) console.log('Spawning thumb process');
 
-        const encoderChild = new this.SubProcessInvocation('ffmpeg', args, {
+        const encoderChild = this.exec('ffmpeg', args, {
             timeout: 15 * 1000
 		});
 
@@ -525,7 +751,7 @@ class HlsVod {
 
         // TODO: Child management
         //var encoderChild = childProcess.spawn(transcoderPath, ['-i', filePath, '-b:a', 64 + 'k', '-ac', '2', '-acodec', 'libaacplus', '-threads', '0', '-f', 'adts', '-']);
-        const encoderChild = new this.SubProcessInvocation('ffmpeg', [
+        const encoderChild = this.exec('ffmpeg', [
             '-i', filePath, '-threads', '0',
             '-b:a', 192 + 'k', '-ac', '2', '-acodec', 'libmp3lame',
             '-map', '0:a:0',
@@ -538,31 +764,32 @@ class HlsVod {
     }
 
     private async handleVideoInitializationRequest(filePath: string): Promise<{ error: string } | { maybeNativelySupported: boolean }> {
-        const probeResult = JSON.parse(await (new this.SubProcessInvocation('ffprobe', [
+        const probeResult = JSON.parse(await (this.exec('ffprobe', [
             '-v', 'error', // Hide debug information
             '-show_format', // Show container information
             '-show_streams', // Show codec information
+            '-of', 'json',
             this.toDiskPath(filePath)
         ], { timeout: ffprobeTimeout })).result());
 
         try {
             const format = probeResult['format']['format_name'].split(',')[0];
-            const audioCodec = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'audio')['codec_name'];
+            const audioStream = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'audio');
             const videoCodec = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'video')['codec_name'];
             return {
-                maybeNativelySupported: (nativeSupportedFormats.container.includes(format) && nativeSupportedFormats.audio.includes(audioCodec) && nativeSupportedFormats.video.includes(videoCodec))
+                maybeNativelySupported: (nativeSupportedFormats.container.includes(format) && (!audioStream || nativeSupportedFormats.audio.includes(audioStream['codec_name'])) && nativeSupportedFormats.video.includes(videoCodec)) && !this.noShortCircuit
             };
         } catch (e) {
             return {
                 error: e.toString()
             };
         }
-    };
+    }
 
     private initExpress(): http.Server {
         const defaultCatch = (response: express.Response) => (error: Error) => response.status(500).send(error.stack || error.toString());
 
-        const respond = (response: express.Response, promise: Promise<string | Buffer | Object>): Promise<unknown> => promise.then(result => (((typeof result === 'string') || Buffer.isBuffer(result)) ? response.send : response.json)(result)).catch(defaultCatch(response));
+        const respond = (response: express.Response, promise: Promise<string | Buffer | Object>): Promise<unknown> => promise.then(result => (((typeof result === 'string') || Buffer.isBuffer(result)) ? response.send(result) : response.json(result))).catch(defaultCatch(response));
         
         const app = express();
         const server = http.createServer(app);
@@ -570,27 +797,30 @@ class HlsVod {
 
         app.use('/', serveStatic(path.join(__dirname, 'static')));
 
+        app.use('/node_modules', serveStatic(path.join(__dirname, 'node_modules')));
+
         app.get('/video/:file', (request, response) => {
             respond(response, this.handleVideoInitializationRequest(request.params['file']));
         });
 
         // m3u8 file has to be under the same path as the TS-files, so they can be linked relatively in the m3u8 file
-        app.get('/hls/:file/master.m3u8', (request, response) => {
+        app.get('/hls.:client/:file/master.m3u8', (request, response) => {
             respond(response, this.cachedMedia.get(request.params['file']).then(media => media.getMasterManifest()));
 		});
 		
-        app.get('/hls/:file/quality-:quality.m3u8', (request, response) => {
-            respond(response, this.cachedMedia.get(request.params['file']).then(media => media.getVariantManifest(request.params['quality'])));
+        app.get('/hls.:client/:file/quality-:quality.m3u8', (request, response) => {
+            respond(response, this.getBackend(request.params['client'], request.params['file'], request.params['quality']).then(backend => backend.getVariantManifest()));
 		});
 
-        app.get('/hls/:file/:segment.ts', (request, response) => {
-            this.cachedMedia.get(request.params['file']).then(media => 
-                media.getSegment(request.params['segment'], request, response)
+        app.get('/hls.:client/:file/:quality.:segment.ts', (request, response) => {
+            this.getBackend(request.params['client'], request.params['file'], request.params['quality']).then(media => 
+                media.getSegment(request.params['client'], request.params['segment'], request, response)
             ).catch(defaultCatch);
-		});
-
-        app.get('/thumbnail/:file', (request, response) => {
-            this.handleThumbnailRequest(request.params['file'], request, response);
+        });
+        
+        app.delete('/hls.:client/', (request, response) => {
+            this.removeClient(request.params['client']);
+            response.sendStatus(200);
         });
 
         app.get('/browse/:file', (request, response) => {
@@ -599,7 +829,13 @@ class HlsVod {
 
         app.use('/raw/', serveStatic(this.rootPath));
 
+        app.get('/thumbnail/:file', (request, response) => {
+            // Legacy feature inherited from hls-vod. Maybe drop the feature?
+            this.handleThumbnailRequest(request.params['file'], request, response);
+        });
+
         app.get('/audio/:file', (request, response) => {
+            // Legacy feature inherited from hls-vod. Maybe drop the feature?
             this.handleAudioRequest(request.params['file'], request, response);
         });
 
@@ -621,7 +857,7 @@ class HlsVod {
     async cleanup() {
         if (this.termination == null) {
 			this.termination = Promise.all([
-				this.SubProcessInvocation.killAll(), // Kill all sub-processes.
+                Promise.all(Array.from(this.allSubProcesses).map(process => process.kill())),
 				util.promisify(this.server.close).call(this.server), // Stop the server.
 				fsExtra.remove(this.outputPath) // Remove all cache files.
 			]);
@@ -638,15 +874,17 @@ if (require.main === module) {
             + ' [--port PORT]'
             + ' [--cache-path PATH]'
 			+ ' [--ffmpeg-binary-dir PATH]'
-			+ ' [--buffer-length SECONDS]'
+            + ' [--buffer-length SECONDS]'
+            + ' [--max-client-number NUMBER]'
             + ' [--debug]'
+            + ' [--no-short-circuit]'
         );
         process.exit();
     }
 
     const server = new HlsVod(parseArgs(process.argv.slice(2), {
-        string: ['port', 'root-path', 'ffmpeg-binary-dir', 'cache-path', 'buffer-length'],
-        boolean: 'debug',
+        string: ['port', 'root-path', 'ffmpeg-binary-dir', 'cache-path', 'buffer-length', 'max-client-number'],
+        boolean: ['debug', 'no-short-circuit'],
         unknown: () => exitWithUsage(process.argv)
     }));
 
