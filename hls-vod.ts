@@ -24,7 +24,7 @@ if (typeof require('fs').Dirent !== 'function') {
 }
 
 const videoExtensions = ['.mp4', '.3gp2', '.3gp', '.3gpp', '.3gp2', '.amv', '.asf', '.avs', '.dat', '.dv', '.dvr-ms', '.f4v', '.m1v', '.m2p', '.m2ts', '.m2v', '.m4v', '.mkv', '.mod', '.mp4', '.mpe', '.mpeg1', '.mpeg2', '.divx', '.mpeg4', '.mpv', '.mts', '.mxf', '.nsv', '.ogg', '.ogm', '.mov', '.qt', '.rv', '.tod', '.trp', '.tp', '.vob', '.vro', '.wmv', '.web,', '.rmvb', '.rm', '.ogv', '.mpg', '.avi', '.mkv', '.wmv', '.asf', '.m4v', '.flv', '.mpg', '.mpeg', '.mov', '.vob', '.ts', '.webm'];
-const audioExtensions = ['.mp3', '.aac', '.m4a'];
+const audioExtensions = ['.mp3', '.aac', '.m4a', '.wma', '.ape', '.flac', '.ra', '.wav'];
 
 type QualityLevelPreset = { resolution: number; videoBitrate: number; audioBitrate: number;  };
 const qualityLevelPresets: Record<string, QualityLevelPreset> = {
@@ -103,6 +103,29 @@ class SubProcessInvocation {
     }
 }
 
+/**
+ * Debounce an async function, such that:
+ * - When a previous call is still pending (unfinished), no calls will go through (so it's not reentrant).
+ * - All calls within the pending period will be collapsed into one, and fired after the pending one gets finished.
+ */
+const asyncDebounce = <T> (method: () => Promise<T>): (() => Promise<T>) => {
+    let inProgress: Promise<T> | null = null;
+    let nextCall: Promise<T> | null = null;
+    const debounced: (() => Promise<T>) = () => {
+        if (!inProgress) {
+            return inProgress = method().finally(() => { 
+                inProgress = null;
+                nextCall = null;
+            });
+        }
+        if (!nextCall) {
+            nextCall = inProgress.then(debounced);
+        }
+        return nextCall;
+    };
+    return debounced;
+};
+
 type QualityLevel = {
     name: string;
     preset: QualityLevelPreset;
@@ -157,7 +180,7 @@ class MediaBackend {
 
     private startTranscode(startAt: number): SubProcessInvocation {
         assert((startAt >= 0) && (startAt < this.parent.breakpoints.length - 1), 'Starting point wrong.');
-        assert(this.segmentStatus[startAt] === EMPTY, 'Segment already being encoded.');
+        assert.strictEqual(this.segmentStatus[startAt], EMPTY, `Segment ${startAt} already being encoded (${this.segmentStatus[startAt]}).`);
 
         let endAt = Math.min(this.parent.breakpoints.length - 1, startAt + 512); // By default, encode the entire video. However, clamp if there are too many (> 512), just to prevent the command from going overwhelmingly long.
 
@@ -262,7 +285,7 @@ class MediaBackend {
         return transcoder;
     }
 
-    private async recalculate(): Promise<void> {
+    private readonly recalculate: (() => Promise<void>) = asyncDebounce(async () => {
         type EncoderHeadInfoTuple = { process: SubProcessInvocation, clients: string[] };
         type ClientHeadInfoTuple = { client: string; firstToEncode: number; bufferedLength: number; ref: ClientStatus; }
 
@@ -336,7 +359,7 @@ class MediaBackend {
             current.ref.transcoder = process;
             lastStartedProcess = { index: current.firstToEncode, process };
         }        
-    }
+    });
 
     private async onGetSegment(clientInfo: ClientStatus, segmentIndex: number): Promise<void> {
         clientInfo.head = segmentIndex;
@@ -483,7 +506,7 @@ class MediaInfo {
             ...Array.from(this.qualityLevels.entries()).map(([levelName, { width, height, preset }]) => [
                 `#EXT-X-STREAM-INF:BANDWIDTH=${
                     Math.ceil((preset.videoBitrate + preset.audioBitrate) * 1.05) // 5% estimated container overhead.
-                },RESOLUTION=${width}x${height}`,
+                },RESOLUTION=${width}x${height},NAME=${levelName}`,
                 `quality-${levelName}.m3u8`
             ])
         ).join(os.EOL)
@@ -763,7 +786,7 @@ class HlsVod {
         request.on('close', encoderChild.kill);
     }
 
-    private async handleVideoInitializationRequest(filePath: string): Promise<{ error: string } | { maybeNativelySupported: boolean }> {
+    private async handleVideoInitializationRequest(filePath: string): Promise<{ error: string } | { maybeNativelySupported: boolean, bufferLength: number }> {
         const probeResult = JSON.parse(await (this.exec('ffprobe', [
             '-v', 'error', // Hide debug information
             '-show_format', // Show container information
@@ -777,7 +800,8 @@ class HlsVod {
             const audioStream = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'audio');
             const videoCodec = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'video')['codec_name'];
             return {
-                maybeNativelySupported: (nativeSupportedFormats.container.includes(format) && (!audioStream || nativeSupportedFormats.audio.includes(audioStream['codec_name'])) && nativeSupportedFormats.video.includes(videoCodec)) && !this.noShortCircuit
+                maybeNativelySupported: (nativeSupportedFormats.container.includes(format) && (!audioStream || nativeSupportedFormats.audio.includes(audioStream['codec_name'])) && nativeSupportedFormats.video.includes(videoCodec)) && !this.noShortCircuit,
+                bufferLength: this.videoMinBufferLength
             };
         } catch (e) {
             return {
