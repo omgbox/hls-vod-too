@@ -1,204 +1,215 @@
-$(function() {
-	var $videoContainer = $('#video-container');
-	var $audioPlayer = $('audio');
-	var $audioContainer = $('#audio-container');
-	var $previewImage = $('#preview-image');
-	var $playerLoading = $('#player-loading');
+const clientId = Math.random().toString(16).substr(2, 6) + '-' + (Date.now() % (2 ** 24)).toString(16);
 
-	// State
-	var mediaElement;
-	var loading = false;
-	var activeTranscodings = [];
+Tonic.add(class HlsVodToo extends Tonic {
+    render () {
+        const pathSectors = this.props.path.split('/').filter(_ => _);
+        const type = pathSectors.shift();
+        const legalPath = pathSectors.join('/');
+        switch (type) {
+            case 'video':
+                return this.html`<hls-vod-video path="${legalPath}"></hls-vod-video>`;
+            case 'directory':
+                return this.html`<hls-vod-browse path="${legalPath}"></hls-vod-browse>`;
+            case 'audio':
+                return this.html`<div class="alert alert-danger">Audio feature not implemented.</div>`;
+            default:
+        }
+        window.location.hash = '#/directory/';
+    }
 
-	function audioStop() {
-		$audioPlayer.prop('controls', false);
-		$audioPlayer[0].pause();
-		$audioContainer.hide();
-	}
+    connected() {
+        window.addEventListener('hashchange', this.hashChange);
+    }
 
-	function videoStop() {
-		if (mediaElement) {
-			mediaElement.pause();
-			$videoContainer.hide();
-		}
-	}
+    disconnected() {
+        window.removeEventListener('hashchange', this.hashChange);
+    }
 
-	function audioPlay(path, name) {
-		$('#audio-song-name').text(name);
+    constructor() {
+        super();
+        this.props.path = location.hash.substr(1);
+        this.hashChange = () => {
+            const path = location.hash.substr(1);
+            if (path !== this.props.path) {
+                this.reRender(() => ({ path }));
+            }
+        };
+    }
+});
 
-		videoStop();
-		audioStop();
-		hidePreviewImage();
+Tonic.add(class HlsVodVideo extends Tonic {
+    async * render() {
+        yield this.html`<div class="alert alert-info">Loading metadata for ${this.props.path}...</div>`;
+        let response;
+        try {
+            response = (await (await fetch(`/video/${encodeURIComponent('/' + this.props.path)}`)).json());
+        } catch (e) {
+            return this.html`<div class="alert alert-danger">Failed to load metadata: ${e}</div>`;
+        }
+        if (response.error) {
+            return this.html`<div class="alert alert-warning">The file cannot be parsed as a video. You may want to <a href="${'/raw/' + encodeURI(this.props.path)}">download</a> it directly.</div>`;
+        }
+        return this.html`<hls-vod-video-impl path="${this.props.path}" native="${response.maybeNativelySupported}" buffer-length="${response.bufferLength}"></hls-vod-video-impl>`
+    }
+});
 
-		$audioPlayer.prop('controls', true);
-		$audioContainer.show();
+Tonic.add(class HlsVodBrowse extends Tonic {
+    async * render() {
+        yield this.html`<div class="alert alert-info">Loading directory ${this.props.path}...</div>`;
+        let list;
+        try {
+            list = await (await fetch(`/browse/${encodeURIComponent('/' + this.props.path)}`)).json();
+        } catch (e) {
+            return this.html`<div class="alert alert-danger">Failed to load directory content: ${e}</div>`;
+        }
+        const sections = this.props.path.split('/');
+        const pathPrefix = this.props.path ? (this.props.path + '/') : '';
+        return this.html`
+            <nav>
+                <ol class="breadcrumb">
+                    <li class="${'breadcrumb-item' + (this.props.path.length ? '' : ' active')}"><a href="#/directory/">Home</a></li>
+                    ${sections.map((section, index) => 
+                        this.html`<li class="${'breadcrumb-item' + ((index === sections.length - 1) ? ' active' : '')}"><a href="${'#/directory/' + encodeURI(sections.slice(0, index + 1).join('/'))}">${section}</a></li>`
+                    )}
+                </ol>
+            </nav>
+            <main>
+                <div class="list-group">
+                    ${list.map(file => this.html`<a class="list-group-item" href="${file.type ? `#/${file.type}/${encodeURI(pathPrefix + file.name)}` : '/raw/' + encodeURI(pathPrefix + file.name)}">${file.name}</a>`)}
+                </div>
+            </main>
+        `;
+    }
+});
 
-		$audioPlayer[0].src = path;
-		$audioPlayer[0].load();
-		$audioPlayer[0].play();
-	}
+Tonic.add(class HlsVodVideoImpl extends Tonic {
+    connected() { this.maybeReinit(); }
 
-	function videoPlay(path) {
-		audioStop();
-		hidePreviewImage();
+    updated() { this.maybeReinit(); }
 
-		$videoContainer.show();
+    disconnected() {
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
+        }
+    }
 
-		if (mediaElement) {
-			mediaElement.pause();
+    maybeReinit() {
+        if (this.hls) {
+            this.hls.destroy();
+            this.hls = null;
+        }
+        const element = this.querySelector('video.hls');
+        const ctrl = this.querySelector('hls-vod-ctrl');
+        if (!element) { return; }
+        const hls = new Hls({
+            maxLength: 10,
+            maxMaxBufferLength: this.props.bufferLength
+        });
+        hls.loadSource(`/hls.${clientId}/${encodeURIComponent(this.props.path)}/master.m3u8`);
+        hls.attachMedia(element);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            element.play();
+            ctrl.reRender(props => ({
+                ...props,
+                levels: hls.levels.map(level => level.name),
+                levelAuto: hls.autoLevelEnabled,
+                level: hls.startLevel
+            }));
+        });
+        hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+            ctrl.reRender(props => ({
+                ...props,
+                levelAuto: hls.autoLevelEnabled,
+                level: data.level,
+                pending: false
+            }));
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => console.error(data));
+        this.hls = hls;
+    }
+    
+    render() {
+        if (this.props.native) {
+            return this.html`
+                <div class="alert alert-info">
+                    This browser is directly playing the video file. <a href="#" data-action="switch-to-hls">Switch to HLS</a> if the video cannot be played.
+                </div>
+                <div class="video-wrap">
+                    <video controls src="${'/raw/' + encodeURI(this.props.path)}"></video>
+                </div>
+            `;
+        } else {
+            return this.html`
+                <div class="video-wrap">
+                    <video class="hls" controls></video>
+                </div>
+                <hls-vod-ctrl></hls-vod-ctrl>
+            `;
+        }
+    }
 
-			mediaElement.setSrc(path);
-			mediaElement.play();
-		}
-		else {
-			var $video = $('#video');
-			$video[0].src = path;
-			$video.mediaelementplayer({
-				stretching: 'responsive',
-				success: function (mediaElement2, domObject) {
-			        mediaElement = mediaElement2;
-					mediaElement.play();
-			    },
-			    error: function (mediaeElement, err) {
-					console.log('Error loading media element');
-			    }
-			});
-		}
-	}
+    click(e) {
+        const actionTarget = Tonic.match(e.target, '[data-action]');
+        if (!actionTarget) { return; }
+        e.preventDefault();
+        if (actionTarget.dataset.action === 'switch-to-hls') {
+            this.reRender(props => ({ ...props, native: false }));
+        }
+    }
+});
 
-	function hidePreviewImage() {
-		$playerLoading.fadeOut(200);
-		$previewImage.hide();
-	}
+Tonic.add(class HlsVodCtrl extends Tonic {
+    render() {
+        const levels = this.props.levels || [];
+        const activeLevel = this.props.level; // might be undefined which is okay.
+        const shown = !!this.props.shown;
+        const disabled = !!this.props.pending;
+        const auto = !!this.props.levelAuto;
+        if (!shown) {
+            return this.html`
+                <form class="text-center"><a href="#" data-action="flip">Show control</a></form>
+            `;
+        } else {
+            return this.html`
+                <form class="text-center">
+                    <a href="#" data-action="flip">Hide control</a><br />
+                    <div class="btn-group btn-group-toggle">
+                        ${levels.map((level, index) => {
+                            const checked = (activeLevel === index) && !auto;
+                            return this.html`
+                                <label class="${'btn btn-secondary' + (checked ? ' active' : '') + (disabled ? ' disabled' : '')}">
+                                    <input type="radio" name="quality" ...${{
+                                        disabled,
+                                        checked
+                                    }} value="${String(index)}" />${level}
+                                </label>
+                            `;
+                        })}
+                        <label class="${'btn btn-secondary' + (auto ? ' active' : '') + (disabled ? ' disabled' : '')}">
+                            <input type="radio" name="quality" ...${{
+                                disabled,
+                                checked: auto
+                            }} value="-1" />Auto ${auto ? ' (' + levels[activeLevel] + ')' : ''}
+                        </label>
+                    </div>
+                </form>
+            `;
+        }
+    }
+    click(e) {
+        const actionTarget = Tonic.match(e.target, '[data-action]');
+        if (!actionTarget) { return; }
+        e.preventDefault();
+        if (actionTarget.dataset.action === 'flip') {
+            this.reRender(props => ({ ...props, shown: !props.shown }));
+        }
+    }
 
-	function showPreviewImage(relPath) {
-		var path = '/thumbnail' + relPath;
-		$previewImage.attr('src', path).fadeIn(200);
-		$playerLoading.fadeIn(200);
-		$previewImage.on('load', function() {
-			$playerLoading.fadeOut(200);
-		});
-		videoStop();
-		audioStop();
-	}
-
-	function updateActiveTranscodings() {
-		$('#transcoders').text('Active transcoders: ' + activeTranscodings.length).fadeIn(200);
-		setTimeout(function() {
-			$('#transcoders').fadeOut(200);
-		}, 5000);
-	}
-
-
-	function browseTo(path) {
-		if (loading) return;
-		loading = true;
-
-		var $fileList = $('#file-list');
-
-		$.ajax('/browse' + path, {
-			success: function(data) {
-				loading = false;
-
-				$('#dir-header').text(data.cwd);
-
-				$fileList.empty();
-
-				var back = $('<li/>');
-				back.html('..');
-				back.click(function() {
-					browseTo(data.cwd != '/' ? path + '/..' : path);
-				});
-				$fileList.append(back);
-
-				$.each(data.files, function(index, file) {
-					var elem = $('<li/>');
-					elem.text(file.name);
-
-					switch(file.type) {
-					case 'video':
-						elem.click(function() {
-							if (activeTranscodings.length == 0 || confirm('Play video? (Will delete any previous encoding)')) {
-								videoPlay(file.path);
-							}
-						});
-						break;
-
-					case 'audio':
-						elem.click(function() {
-							audioPlay(file.path, file.name);
-						});
-						break;
-
-					case 'directory':
-						elem.click(function() {
-							browseTo(file.path);
-						});
-						break;
-
-						default:
-					}
-
-					if (file.error) {
-						elem.attr('title', file.errorMsg);
-					}
-
-					if (file.type == 'video' || file.type == 'audio') {
-						var rawLink = $('<a style="color: inherit; margin-left: 1em; padding: 1em" />').attr('href', '/raw' + file.relPath).text('RAW');
-						rawLink.click(function(event) {
-							event.stopPropagation();
-						});
-						elem.append(rawLink);
-					}
-
-					if (file.type == 'video') {
-						var thumbLink = $('<span style="padding: 1em" />').text('Preview');
-						thumbLink.click(function(event) {
-							event.stopPropagation();
-							showPreviewImage(file.relPath);
-						});
-						elem.append(thumbLink);
-					}
-
-					$('#file-list').append(elem);
-				});
-			}
-		});
-	}
-
-
-	$('#settings-btn').click(function() {
-		$('#settings-container').fadeToggle();
-	});
-
-	$('#settings-container select[name=videoBitrate]').change(function() {
-		$.ajax('/settings', {
-			data: {
-				videoBitrate: $(this).val()
-			},
-			type: 'POST',
-			error: function() {
-				alert('Failed');
-			}
-		});
-	});
-
-	$.get('/settings', function(data) {
-		$('#settings-container select[name=videoBitrate]').val(data.videoBitrate);
-	});
-
-
-	var socket = io.connect();
-
-	socket.on('updateActiveTranscodings', function(data) {
-		activeTranscodings = data;
-		updateActiveTranscodings();
-	});
-
-	browseTo('/');
-
-	$videoContainer.hide();
-	$audioContainer.hide();
-	$previewImage.hide();
-	$playerLoading.hide();
+    input(e) {
+        if (e.target.name !== 'quality') { return; }
+        const level = parseInt(e.target.value);
+        this.reRender((props) => ({ ...props, pending: true }));
+        this.parentNode.hls.nextLevel = level;
+    }
 });

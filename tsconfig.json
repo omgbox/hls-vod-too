@@ -1,0 +1,10 @@
+{
+    "compilerOptions": {
+        "target": "ES2018",
+        "module": "CommonJS",
+        "allowJs": false,
+        "strict": true,
+        "moduleResolution": "node"
+    },
+    "include": ["hls-vod.ts"]
+}
