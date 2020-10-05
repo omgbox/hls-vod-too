@@ -518,72 +518,6 @@ class MediaInfo {
         return level.backend;
     }
 
-    private getKeyFramesToBeUsedForThumbnails(numOfFrames: number): Float64Array | null {
-        const duration = this.breakpoints[this.breakpoints.length - 1];
-        const keyFrames = new Float64Array(numOfFrames);
-        let firstLater = 0; // First index in this.rawIFrames that equal to or later than `time`.
-        for (let i = 0; i < numOfFrames; i++) {           
-            // If we want 4 frames, they should be at 12.5%, 37.5%, 62.5% and 87.5%: ---+------+------+------+---.
-            // Same applies when we want more frames: they should spread evenly.
-            const time = (i + 0.5) / numOfFrames * duration;
-            while ((firstLater < this.rawIFrames.length) && (this.rawIFrames[firstLater] < time)) {
-                firstLater++;
-            }
-            let upperDistance = Number.POSITIVE_INFINITY;
-            if (firstLater < this.rawIFrames.length) {
-                upperDistance = this.rawIFrames[firstLater] - time;
-            }
-            let lowerDistance = Number.POSITIVE_INFINITY;
-            if (firstLater > 0) {
-                lowerDistance = time - this.rawIFrames[firstLater - 1];
-            }
-            if (upperDistance > lowerDistance) {
-                keyFrames[i] = this.rawIFrames[firstLater - 1];
-            } else { // Cannot be both infinity, as we have at least one keyframe.
-                keyFrames[i] = this.rawIFrames[firstLater];
-            }
-            if ((i > 0) && (keyFrames[i] === keyFrames[i - 1])) {
-                // Too keyframes are too far from each other. Maybe the keyframes are located unevenly. 
-                return null;
-            }
-        }
-        return keyFrames;
-    }
-
-    generateThumbnail(xCount: number, yCount: number, singleWidth: number, request: express.Request, response: express.Response) { // Caller should ensure the counts are integers.
-        assert(xCount >= 1 && xCount <= 8);
-        assert(yCount >= 1 && yCount <= 8);
-        assert(singleWidth >= 20 && (singleWidth * xCount) < 4800);
-        const numOfFrames = xCount * yCount;
-
-        let canUseKeyFrames = this.rawIFrames.length >= numOfFrames;
-        let vf = null;
-
-        if (canUseKeyFrames) {
-            const keyframes = this.getKeyFramesToBeUsedForThumbnails(numOfFrames);
-            if (keyframes) {
-                vf = `select='eq(pict_type\\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\\,0.5))*(${[].map.call(keyframes, time => `between(t\\,${time-0.25}\\,${time+0.25})`).join('+')}')`;
-                this.log('Screenshot using keyframes', vf);
-            }
-        }
-
-        if (!vf) {
-            const duration = this.breakpoints[this.breakpoints.length - 1];
-            vf = `fps=1/${(duration / numOfFrames)}`;
-            this.log('Fallback: no enough keyframes for screenshot.');
-        }
-
-        const args = ['-i', this.parent.toDiskPath(this.relPath), '-vf', `${vf},scale=${singleWidth}:-2,tile=${xCount}x${yCount}'`, '-f', 'image2pipe', '-vframes', '1', '-'];
-
-        const encoderChild = this.parent.exec('ffmpeg', args, {
-            timeout: 15 * 1000
-		});
-
-		encoderChild.stdout.pipe(response);
-		response.setHeader('Content-Type', 'image/jpeg');
-        request.on('close', encoderChild.kill);
-    }
-
     /**
 	 * Calculate the timestamps to segment the video at. 
 	 * Returns all segments endpoints, including video starting time (0) and end time.
@@ -819,6 +753,36 @@ class HlsVod {
         return fileList;
     }
 
+    private async handleThumbnailRequest(file: string, xCount: number, yCount: number, singleWidth: number, request: express.Request, response: express.Response) { // Caller should ensure the counts are integers.
+        const fsPath = this.toDiskPath(file);
+
+        assert(xCount >= 1 && xCount <= 8);
+        assert(yCount >= 1 && yCount <= 8);
+        assert(singleWidth >= 20 && (singleWidth * xCount) < 4800);
+        const numOfFrames = xCount * yCount;
+
+        const probeResult = JSON.parse(await (this.exec('ffprobe', [
+            '-v', 'error', // Hide debug information
+            '-show_entries', 'stream=duration', // Show duration
+            '-select_streams', 'v', // Video stream only, we're not interested in audio
+            '-of', 'json',
+            fsPath
+        ], { timeout: ffprobeTimeout })).result());
+
+        const duration = parseFloat(probeResult['streams'][0]['duration']);
+        assert(!isNaN(duration));
+
+        const vf = `fps=1/${(duration / numOfFrames)}`;
+
+        const encoderChild = this.exec('ffmpeg', ['-i', fsPath, '-vf', `${vf},scale=${singleWidth}:-2,tile=${xCount}x${yCount}'`, '-f', 'image2pipe', '-vframes', '1', '-'], {
+            timeout: 30 * 1000
+		});
+
+		encoderChild.stdout.pipe(response);
+		response.setHeader('Content-Type', 'image/jpeg');
+        request.on('close', encoderChild.kill);
+    }
+
     // TODO: Legacy method. Will improve later.
     // Problem: some clients interrupt the HTTP request and send a new one, causing the song to restart...
     private handleAudioRequest(relPath: string, request: express.Request, response: express.Response): void {
@@ -911,7 +875,7 @@ class HlsVod {
             const y = parseInt(request.query['y'] as string);
             const singleWidth = parseInt(request.query['width'] as string);
             assert(!isNaN(x) && !isNaN(y));
-            this.cachedMedia.get(request.params['file']).then(media => media.generateThumbnail(x, y, singleWidth, request, response));
+            this.handleThumbnailRequest(request.params['file'], x, y, singleWidth, request, response).catch(defaultCatch);
         });
 
         app.get('/audio/:file', (request, response) => {
