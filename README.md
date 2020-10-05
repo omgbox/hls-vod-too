@@ -1,11 +1,9 @@
 hls-vod-too 📺
 =======
 
-**WORK IN PROGRESS. NOTHING IS USABLE AT THIS MOMENT.**
-
 HTTP Live Streaming with on-the-fly encoding of any video file. Supports modern browsers through the use of [hls.js](https://github.com/video-dev/hls.js/).
 
-Relationship with the original [hls-vod](https://github.com/mifi/hls-vod)
+Differences from the original [hls-vod](https://github.com/mifi/hls-vod)
 -------------------------------------------------------------------------
 
 This is like a re-write of the orignal hls-vod. 
@@ -24,6 +22,8 @@ But as the differences (listed below) are huge, I decided to name this as a new 
   - Supports multiple transcodings at the same time.
     - The max number of concurrent users can be specified by `--max-client-number`.
     - When multiple users play the same file (at the same quality level), the file will only be transcoded once. 
+  - Better screenshots (preview).
+    - Take screenshots evenly throughout the video, instead of just near the beginning of the video.
 - Shortcomings
   - Not supporting VLC as backend. Only supports ffmpeg.
   - Legacy browsers won't be supported, as the code uses ES6 classes, web components, async generator functions, etc..
@@ -63,8 +63,4 @@ Arguments
 --no-short-circuit - Always playback through HLS, even when the file is directly playable in browsers.
 ```
 
-For more arguments run it without arguments: `hls-vod`
-
-Limitations
------------
-- Currently only supports encoding one stream at a time (only one user at a time).
+For more arguments run it without arguments: `hls-vod-too`

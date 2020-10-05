@@ -19,7 +19,7 @@
     "static"
   ],
   "bin": {
-    "hls-vod": "ts-node hls-vod.ts"
+    "hls-vod-too": "ts-node hls-vod.ts"
   },
   "engines": {
     "node": ">=10.12"
@@ -30,8 +30,7 @@
     "fs-extra": "^9.0.1",
     "hls.js": "^0.14.13",
     "minimist": "^1.2.0",
-    "serve-static": "^1.13.5",
-    "socket.io": "^2.1.11"
+    "serve-static": "^1.13.5"
   },
   "devDependencies": {
     "@types/express": "^4.17.8",

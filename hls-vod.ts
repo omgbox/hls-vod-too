@@ -16,8 +16,6 @@ import fsExtra = require('fs-extra');
 import express = require('express');
 import serveStatic = require('serve-static');
 import parseArgs = require('minimist');
-import socketIo = require('socket.io');
-import { timeStamp } from 'console';
 
 if (typeof require('fs').Dirent !== 'function') {
     throw new Error(`The Node.js version is too old for ${__filename} to run.`);
@@ -26,14 +24,14 @@ if (typeof require('fs').Dirent !== 'function') {
 const videoExtensions = ['.mp4', '.3gp2', '.3gp', '.3gpp', '.3gp2', '.amv', '.asf', '.avs', '.dat', '.dv', '.dvr-ms', '.f4v', '.m1v', '.m2p', '.m2ts', '.m2v', '.m4v', '.mkv', '.mod', '.mp4', '.mpe', '.mpeg1', '.mpeg2', '.divx', '.mpeg4', '.mpv', '.mts', '.mxf', '.nsv', '.ogg', '.ogm', '.mov', '.qt', '.rv', '.tod', '.trp', '.tp', '.vob', '.vro', '.wmv', '.web,', '.rmvb', '.rm', '.ogv', '.mpg', '.avi', '.mkv', '.wmv', '.asf', '.m4v', '.flv', '.mpg', '.mpeg', '.mov', '.vob', '.ts', '.webm'];
 const audioExtensions = ['.mp3', '.aac', '.m4a', '.wma', '.ape', '.flac', '.ra', '.wav'];
 
-type QualityLevelPreset = { resolution: number; videoBitrate: number; audioBitrate: number;  };
-const qualityLevelPresets: Record<string, QualityLevelPreset> = {
-    '1080p-extra': { resolution: 1080, videoBitrate: 14400, audioBitrate: 320 },
-    '1080p': { resolution: 1080, videoBitrate: 9600,  audioBitrate: 224 },
-    '720p': { resolution: 720, videoBitrate: 4800,  audioBitrate: 160 },
-    '480p': { resolution: 480, videoBitrate: 2400,  audioBitrate: 128 },
-    '360p': { resolution: 360, videoBitrate: 1200,  audioBitrate: 112 }
-};
+type QualityLevelPreset = { name: string; resolution: number; videoBitrate: number; audioBitrate: number; };
+const qualityLevelPresets: QualityLevelPreset[] = [
+    { name: '1080p-extra', resolution: 1080, videoBitrate: 14400, audioBitrate: 320 },
+    { name: '1080p', resolution: 1080, videoBitrate: 9600,  audioBitrate: 224 },
+    { name: '720p', resolution: 720, videoBitrate: 4800,  audioBitrate: 160 },
+    { name: '480p', resolution: 480, videoBitrate: 2400,  audioBitrate: 128 },
+    { name: '360p', resolution: 360, videoBitrate: 1200,  audioBitrate: 112 }
+].sort((a, b) => (b.resolution - a.resolution) || (b.videoBitrate - a.videoBitrate));
 
 const ffprobeTimeout = 30 * 1000; // millisecs.
 const processCleanupTimeout = 6 * 60 * 60 * 1000; // millisecs.
@@ -127,7 +125,6 @@ const asyncDebounce = <T> (method: () => Promise<T>): (() => Promise<T>) => {
 };
 
 type QualityLevel = {
-    name: string;
     preset: QualityLevelPreset;
     width: number;
     height: number;
@@ -219,7 +216,7 @@ class MediaBackend {
             '-segment_start_number', `${startAt}`,
             '-segment_list_type', 'flat',
             '-segment_list', 'pipe:1', // Output completed segments to stdout.
-            `${this.config.name}-%05d.ts`
+            `${this.config.preset.name}-%05d.ts`
         ], { cwd: this.parent.outDir });
 
         const encoderId = this.findNextAvailableId();
@@ -244,8 +241,8 @@ class MediaBackend {
         readline.createInterface({
             input: transcoder.stdout,
         }).on('line', tsFileName => {
-            assert(tsFileName.startsWith(this.config.name + '-') && tsFileName.endsWith('.ts'), `Unexpected segment produced by ffmpeg: ${tsFileName}.`);
-            const index = parseInt(tsFileName.substring(this.config.name.length + 1, tsFileName.length - 3), 10);
+            assert(tsFileName.startsWith(this.config.preset.name + '-') && tsFileName.endsWith('.ts'), `Unexpected segment produced by ffmpeg: ${tsFileName}.`);
+            const index = parseInt(tsFileName.substring(this.config.preset.name.length + 1, tsFileName.length - 3), 10);
             if (index !== status.head) {
                 if (this.segmentStatus[status.head] === encoderId) {
                     this.segmentStatus[status.head] = EMPTY;
@@ -369,7 +366,7 @@ class MediaBackend {
 
     getVariantManifest(): string {
         const breakpoints = this.parent.breakpoints;
-        const qualityLevelName = this.config.name;
+        const qualityLevelName = this.config.preset.name;
         const segments = new Array((breakpoints.length - 1) * 2);
         for (let i = 1; i < breakpoints.length; i++) {
             segments[i * 2 - 2] = '#EXTINF:' + (breakpoints[i] - breakpoints[i - 1]).toFixed(3);
@@ -403,7 +400,7 @@ class MediaBackend {
         this.onGetSegment(clientInfo, segmentIndex);
 
         if (fileReady) {
-            const fileName = `${this.config.name}-${((segmentIndex + 1e5) % 1e6).toString().substr(1)}.ts`;
+            const fileName = `${this.config.preset.name}-${((segmentIndex + 1e5) % 1e6).toString().substr(1)}.ts`;
             const filePath = path.join(this.parent.outDir, fileName);
             response.sendFile(filePath);
             return;
@@ -446,12 +443,13 @@ class MediaBackend {
     }
 
     log(...params: any): void {
-        this.parent.log(`[${this.config.name}]`, ...params);
+        this.parent.log(`[${this.config.preset.name}]`, ...params);
     }
 }
 
 class MediaInfo {
     private readonly qualityLevels: Map<string, QualityLevel>;
+    readonly rawIFrames: Float64Array;
     readonly breakpoints: Float64Array;
 
     private constructor(
@@ -461,16 +459,17 @@ class MediaInfo {
         readonly ffProbeResult: string
     ) { 
         const ffprobeOutput = JSON.parse(ffProbeResult);
-		const { width, height, duration } = ffprobeOutput['streams'][0];
+        const { width, height, duration } = ffprobeOutput['streams'][0];
+        assert(duration > 0.5, 'Video too short.');
 		
 		const resolution = Math.min(width, height);
-        const validIFrames = ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter((time: number) => !isNaN(time));
+        this.rawIFrames = Float64Array.from(ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter((time: number) => !isNaN(time)));
         
-		this.breakpoints = MediaInfo.convertToSegments(validIFrames, duration);
-		
-        this.qualityLevels = new Map(Object.entries(qualityLevelPresets).filter(([_, preset]) => preset.resolution <= resolution).map(([name, preset]) => 
-            [name, {
-                name,
+		this.breakpoints = MediaInfo.convertToSegments(this.rawIFrames, duration);
+        
+        const presets = qualityLevelPresets.filter(preset => preset.resolution <= resolution);
+        this.qualityLevels = new Map((presets.length ? presets : [qualityLevelPresets[qualityLevelPresets.length - 1]]).map(preset => 
+            [preset.name, {
                 preset,
                 width: Math.round(width / resolution * preset.resolution),
                 height: Math.round(height / resolution * preset.resolution),
@@ -478,7 +477,7 @@ class MediaInfo {
             }]
         )); 
 
-        this.log(`Video transcoder initialized. Using output directory ${outDir}.`);
+        this.log(`Video information initialized. Using output directory ${outDir}.`);
     }
 
     public static async getInstance(
@@ -519,6 +518,72 @@ class MediaInfo {
         return level.backend;
     }
 
+    private getKeyFramesToBeUsedForThumbnails(numOfFrames: number): Float64Array | null {
+        const duration = this.breakpoints[this.breakpoints.length - 1];
+        const keyFrames = new Float64Array(numOfFrames);
+        let firstLater = 0; // First index in this.rawIFrames that equal to or later than `time`.
+        for (let i = 0; i < numOfFrames; i++) {           
+            // If we want 4 frames, they should be at 12.5%, 37.5%, 62.5% and 87.5%: ---+------+------+------+---.
+            // Same applies when we want more frames: they should spread evenly.
+            const time = (i + 0.5) / numOfFrames * duration;
+            while ((firstLater < this.rawIFrames.length) && (this.rawIFrames[firstLater] < time)) {
+                firstLater++;
+            }
+            let upperDistance = Number.POSITIVE_INFINITY;
+            if (firstLater < this.rawIFrames.length) {
+                upperDistance = this.rawIFrames[firstLater] - time;
+            }
+            let lowerDistance = Number.POSITIVE_INFINITY;
+            if (firstLater > 0) {
+                lowerDistance = time - this.rawIFrames[firstLater - 1];
+            }
+            if (upperDistance > lowerDistance) {
+                keyFrames[i] = this.rawIFrames[firstLater - 1];
+            } else { // Cannot be both infinity, as we have at least one keyframe.
+                keyFrames[i] = this.rawIFrames[firstLater];
+            }
+            if ((i > 0) && (keyFrames[i] === keyFrames[i - 1])) {
+                // Too keyframes are too far from each other. Maybe the keyframes are located unevenly. 
+                return null;
+            }
+        }
+        return keyFrames;
+    }
+
+    generateThumbnail(xCount: number, yCount: number, singleWidth: number, request: express.Request, response: express.Response) { // Caller should ensure the counts are integers.
+        assert(xCount >= 1 && xCount <= 8);
+        assert(yCount >= 1 && yCount <= 8);
+        assert(singleWidth >= 20 && (singleWidth * xCount) < 4800);
+        const numOfFrames = xCount * yCount;
+
+        let canUseKeyFrames = this.rawIFrames.length >= numOfFrames;
+        let vf = null;
+
+        if (canUseKeyFrames) {
+            const keyframes = this.getKeyFramesToBeUsedForThumbnails(numOfFrames);
+            if (keyframes) {
+                vf = `select='eq(pict_type\\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\\,0.5))*(${[].map.call(keyframes, time => `between(t\\,${time-0.25}\\,${time+0.25})`).join('+')}')`;
+                this.log('Screenshot using keyframes', vf);
+            }
+        }
+
+        if (!vf) {
+            const duration = this.breakpoints[this.breakpoints.length - 1];
+            vf = `fps=1/${(duration / numOfFrames)}`;
+            this.log('Fallback: no enough keyframes for screenshot.');
+        }
+
+        const args = ['-i', this.parent.toDiskPath(this.relPath), '-vf', `${vf},scale=${singleWidth}:-2,tile=${xCount}x${yCount}'`, '-f', 'image2pipe', '-vframes', '1', '-'];
+
+        const encoderChild = this.parent.exec('ffmpeg', args, {
+            timeout: 15 * 1000
+		});
+
+		encoderChild.stdout.pipe(response);
+		response.setHeader('Content-Type', 'image/jpeg');
+        request.on('close', encoderChild.kill);
+    }
+
     /**
 	 * Calculate the timestamps to segment the video at. 
 	 * Returns all segments endpoints, including video starting time (0) and end time.
@@ -530,8 +595,8 @@ class MediaInfo {
 	 * 
 	 * This guarantees that all segments are between the duration 2.33 s and 4.75 s.
 	 */
-	private static convertToSegments(rawTimeList: number[], duration: number): Float64Array {
-		const timeList = rawTimeList.concat([duration]);
+	private static convertToSegments(rawTimeList: Float64Array, duration: number): Float64Array {
+		const timeList = [...rawTimeList, duration];
 		const segmentStartTimes = [0];
 		let lastTime = 0;
 		for (const time of timeList) {
@@ -681,8 +746,14 @@ class HlsVod {
         { timeout, cwd } : { timeout?: number, cwd?: string } = {}
     ): SubProcessInvocation {
         const handle = new SubProcessInvocation(this.ffmpegBinaryDir + command, args, cwd || this.outputPath, timeout || processCleanupTimeout);
+        const started = Date.now();
         this.allSubProcesses.add(handle);
-        handle.promise.finally(() => this.allSubProcesses.delete(handle));
+        handle.promise.finally(() => {
+            this.allSubProcesses.delete(handle);
+            if (this.debug) {
+                console.log(`Subprocess ${handle.pid} took ${(Date.now() - started)} ms.`);
+            }
+        });
         return handle;
     }
 
@@ -709,7 +780,7 @@ class HlsVod {
             }
         } else {
             existing.then(backend => {
-                if (backend.config.name !== qualityLevel || backend.parent.relPath !== file) {
+                if (backend.config.preset.name !== qualityLevel || backend.parent.relPath !== file) {
                     backend.removeClient(clientId);
                 }
             });
@@ -746,25 +817,6 @@ class HlsVod {
             return fileObj;
         });
         return fileList;
-    }
-
-    // TODO: Legacy method. Will improve later.
-    private handleThumbnailRequest(file: string, request: express.Request, response: express.Response): void {
-        const fsPath = this.toDiskPath(file);
-
-        // http://superuser.com/questions/538112/meaningful-thumbnails-for-a-video-using-ffmpeg
-        //var args = ['-ss', '00:00:20', '-i', fsPath, '-vf', 'select=gt(scene\,0.4)', '-vf', 'scale=iw/2:-1,crop=iw:iw/2', '-f', 'image2pipe', '-vframes', '1', '-'];
-        var args = ['-ss', '00:00:20', '-i', fsPath, '-vf', 'select=eq(pict_type\\,PICT_TYPE_I),scale=640:-1,tile=2x2', '-f', 'image2pipe', '-vframes', '1', '-'];
-
-        if (this.debug) console.log('Spawning thumb process');
-
-        const encoderChild = this.exec('ffmpeg', args, {
-            timeout: 15 * 1000
-		});
-
-		encoderChild.stdout.pipe(response);
-		response.setHeader('Content-Type', 'image/jpeg');
-        request.on('close', encoderChild.kill);
     }
 
     // TODO: Legacy method. Will improve later.
@@ -816,8 +868,9 @@ class HlsVod {
         const respond = (response: express.Response, promise: Promise<string | Buffer | Object>): Promise<unknown> => promise.then(result => (((typeof result === 'string') || Buffer.isBuffer(result)) ? response.send(result) : response.json(result))).catch(defaultCatch(response));
         
         const app = express();
+        app.set('query parser', 'simple');
+
         const server = http.createServer(app);
-        const io = socketIo(server);
 
         app.use('/', serveStatic(path.join(__dirname, 'static')));
 
@@ -853,9 +906,12 @@ class HlsVod {
 
         app.use('/raw/', serveStatic(this.rootPath));
 
-        app.get('/thumbnail/:file', (request, response) => {
-            // Legacy feature inherited from hls-vod. Maybe drop the feature?
-            this.handleThumbnailRequest(request.params['file'], request, response);
+        app.get('/hls.:client/:file/thumbnail.jpg', (request, response) => {
+            const x = parseInt(request.query['x'] as string);
+            const y = parseInt(request.query['y'] as string);
+            const singleWidth = parseInt(request.query['width'] as string);
+            assert(!isNaN(x) && !isNaN(y));
+            this.cachedMedia.get(request.params['file']).then(media => media.generateThumbnail(x, y, singleWidth, request, response));
         });
 
         app.get('/audio/:file', (request, response) => {
