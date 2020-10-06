@@ -753,7 +753,7 @@ class HlsVod {
         return fileList;
     }
 
-    private async handleThumbnailRequest(file: string, xCount: number, yCount: number, singleWidth: number, request: express.Request, response: express.Response) { // Caller should ensure the counts are integers.
+    private async handleThumbnailRequest(file: string, xCount: number, yCount: number, singleWidth: number, onePiece: boolean, request: express.Request, response: express.Response) { // Caller should ensure the counts are integers.
         const fsPath = this.toDiskPath(file);
 
         assert(xCount >= 1 && xCount <= 8);
@@ -774,8 +774,8 @@ class HlsVod {
 
         const vf = `fps=1/${(duration / numOfFrames)}`;
 
-        const encoderChild = this.exec('ffmpeg', ['-i', fsPath, '-vf', `${vf},scale=${singleWidth}:-2,tile=${xCount}x${yCount}'`, '-f', 'image2pipe', '-vframes', '1', '-'], {
-            timeout: 30 * 1000
+        const encoderChild = this.exec('ffmpeg', ['-i', fsPath, '-vf', `${vf},scale=${singleWidth}:-2${onePiece ? `,tile=${xCount}x${yCount}` : ''}'`, '-f', 'image2pipe', ...(onePiece ? ['-vframes', '1'] : ''), '-'], {
+            timeout: 45 * 1000
 		});
 
 		encoderChild.stdout.pipe(response);
@@ -870,12 +870,14 @@ class HlsVod {
 
         app.use('/raw/', serveStatic(this.rootPath));
 
-        app.get('/hls.:client/:file/thumbnail.jpg', (request, response) => {
+        app.get('/thumbnail/:file', (request, response) => {
             const x = parseInt(request.query['x'] as string);
             const y = parseInt(request.query['y'] as string);
             const singleWidth = parseInt(request.query['width'] as string);
+            const onePiece = !!parseInt(request.query['one'] as string);
             assert(!isNaN(x) && !isNaN(y));
-            this.handleThumbnailRequest(request.params['file'], x, y, singleWidth, request, response).catch(defaultCatch);
+            // Legacy feature inherited from hls-vod. Maybe drop the feature?
+            this.handleThumbnailRequest(request.params['file'], x, y, singleWidth, onePiece, request, response);
         });
 
         app.get('/audio/:file', (request, response) => {

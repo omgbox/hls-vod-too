@@ -9,6 +9,25 @@ hls-vod-browse {
     display: block;
 }
 
+hls-vod-browse .list-group-item .material-icons {
+    font-size: 16px;
+    vertical-align: middle;
+}
+
+hls-vod-browse .list-group-item .badge {
+    cursor: pointer;
+}
+
+hls-vod-thumbnail table {
+    width: 100%;
+    table-layout: fixed;
+    text-align: center;
+} 
+
+hls-vod-thumbnail img {
+    max-width: 100%;
+}
+
 hls-vod-video {
     padding: 16px;
     display: block;

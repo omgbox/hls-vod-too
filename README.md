@@ -24,6 +24,8 @@ But as the differences (listed below) are huge, I decided to name this as a new 
     - When multiple users play the same file (at the same quality level), the file will only be transcoded once. 
   - Better screenshots (preview).
     - Take screenshots evenly throughout the video, instead of just near the beginning of the video.
+    - Allow users to select the number of images in the thumbnail tile.
+    - Loading images one by one instead of loading the tile at once, so some partial images can be rendered earlier.
 - Shortcomings
   - Not supporting VLC as backend. Only supports ffmpeg.
   - Legacy browsers won't be supported, as the code uses ES6 classes, web components, async generator functions, etc..
