@@ -16,10 +16,14 @@
   "license": "MIT",
   "files": [
     "hls-vod.ts",
+    "hls-vod-too.js",
     "static"
   ],
+  "scripts": {
+    "start": "ts-node hls-vod.ts"
+  },
   "bin": {
-    "hls-vod": "ts-node hls-vod.ts"
+    "hls-vod-too": "hls-vod-too.js"
   },
   "engines": {
     "node": ">=10.12"

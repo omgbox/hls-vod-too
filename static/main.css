@@ -9,26 +9,58 @@ hls-vod-browse {
     display: block;
 }
 
-hls-vod-video {
+hls-vod-browse .list-group-item .material-icons {
+    font-size: 16px;
+    vertical-align: middle;
+}
+
+hls-vod-browse .list-group-item .badge {
+    cursor: pointer;
+}
+
+hls-vod-thumbnail table {
+    width: 100%;
+    table-layout: fixed;
+    text-align: center;
+} 
+
+hls-vod-thumbnail img {
+    max-width: 100%;
+}
+
+hls-vod-too > hls-vod-media {
     padding: 16px;
     display: block;
     height: 100%;
 }
 
-hls-vod-video-impl {
+hls-vod-too > hls-vod-media hls-vod-video {
     height: 100%;
     display: flex;
     flex-direction: column;
 }
 
-hls-vod-video-impl .video-wrap {
+hls-vod-too > hls-vod-media .video-wrap {
     flex-shrink: 1;
     flex-grow: 1;
     position: relative;
 }
 
-hls-vod-video-impl .video-wrap video {
+hls-vod-too > hls-vod-media .video-wrap > video {
     max-width: 100%;
     max-height: 100%;
     position: absolute;
+}
+
+hls-vod-media-pre > hls-vod-media {
+    padding-top: 16px;
+    display: block;
+}
+
+hls-vod-media-pre > hls-vod-media .video-wrap {
+    text-align: center;
+}
+
+hls-vod-media-pre > hls-vod-media .video-wrap > video {
+    max-width: 100%;
 }
