@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env ts-node-script
 
 import assert = require('assert');
 import childProcess = require('child_process');
@@ -33,15 +33,19 @@ const qualityLevelPresets: QualityLevelPreset[] = [
     { name: '360p', resolution: 360, videoBitrate: 1200,  audioBitrate: 112 }
 ].sort((a, b) => (b.resolution - a.resolution) || (b.videoBitrate - a.videoBitrate));
 
+const audioPreset: QualityLevelPreset = { name: 'audio', resolution: NaN, videoBitrate: 0, audioBitrate: 320 };
+
 const ffprobeTimeout = 30 * 1000; // millisecs.
 const processCleanupTimeout = 6 * 60 * 60 * 1000; // millisecs.
 
 // Those formats can be supported by the browser natively: transcoding may not be needed for them.
-// Listed in https://www.chromium.org/audio-video; change accordingly if you are mainly targeting another browser.
+// As listed in https://www.chromium.org/audio-video, and translated into ffmpeg codecs/formats identifiers.
+// Change accordingly if you are mainly targeting an old or strange browser (i.e. if you are targeting Apple platforms, you want want to only keep the first entry in each list).
 const nativeSupportedFormats = {
-    container: ['mov', 'mp4', 'webm', 'ogg'],
-    video: ['h264','vp8', 'vp9',' theora'],
-    audio: ['aac', 'mp3', 'vorbis', 'opus', 'pcm_u8', 'pcm_s16le', 'pcm_f32le', 'flac']
+    videoCodec: ['h264','vp8', 'vp9',' theora'],
+    audioCodec: ['aac', 'mp3', 'vorbis', 'opus', 'pcm_u8', 'pcm_s16le', 'pcm_f32le', 'flac'],
+    videoContainer: ['mov', 'mp4', 'webm', 'ogg'],
+    audioContainer: ['mp3', 'flac', 'ogg']
 };
 
 class SubProcessInvocation {
@@ -155,6 +159,8 @@ class MediaBackend {
     private lastAssignedId: number = 1;
 
     constructor(readonly parent: MediaInfo, readonly config: QualityLevel) {
+        assert.strictEqual(config.backend, null, 'Backend already exists.');
+        config.backend = this;
         this.segmentStatus = new Uint8Array(parent.breakpoints.length - 1); // Defaults to EMPTY.
         this.segmentStatus.fill(EMPTY);
     }
@@ -188,23 +194,28 @@ class MediaBackend {
             }
         }
 
-        const commaSeparatedTimes = this.parent.breakpoints.subarray(startAt + 1, endAt).join(',');
+        const commaSeparatedTimes = [].map.call(
+            this.parent.breakpoints.subarray(startAt + 1, endAt), 
+            (num: number) => num.toFixed(6) // AV_TIME_BASE is 1000000, so 6 decimal digits will match.
+        ).join(',');
 
         const transcoder = this.parent.parent.exec('ffmpeg', [
             '-loglevel', 'warning',
-            '-ss', `${this.parent.breakpoints[startAt]}`, // Seek to start point. 
+            ...(startAt ? ['-ss', `${this.parent.breakpoints[startAt]}`] : []), // Seek to start point. Note there is a bug(?) in ffmpeg: https://github.com/FFmpeg/FFmpeg/blob/fe964d80fec17f043763405f5804f397279d6b27/fftools/ffmpeg_opt.c#L1240 can possible set `seek_timestamp` to a negative value, which will cause `avformat_seek_file` to reject the input timestamp. To prevent this, the first break point, which we know will be zero, will not be fed to `-ss`.
             '-i', this.parent.parent.toDiskPath(this.parent.relPath), // Input file
             '-to', `${this.parent.breakpoints[endAt]}`,
             '-copyts', // So the "-to" refers to the original TS.
             '-force_key_frames', commaSeparatedTimes,
-            '-vf', 'scale=' + ((this.config.width >= this.config.height) ? `-2:${this.config.height}` : `${this.config.width}:-2`), // Scaling
-            '-preset', 'faster',
             '-sn', // No subtitles
-            // Video params:
-            '-c:v', 'libx264',
-            '-profile:v', 'high',
-            '-level:v', '4.0',
-            '-b:v', `${this.config.preset.videoBitrate}k`,
+            ...(this.config.preset.videoBitrate ? [
+                '-vf', 'scale=' + ((this.config.width >= this.config.height) ? `-2:${this.config.height}` : `${this.config.width}:-2`), // Scaling
+                '-preset', 'faster',
+                // Video params:
+                '-c:v', 'libx264',
+                '-profile:v', 'high',
+                '-level:v', '4.0',
+                '-b:v', `${this.config.preset.videoBitrate}k`,
+            ] : []),
             // Audio params:
             '-c:a', 'aac',
             '-b:a', `${this.config.preset.audioBitrate}k`,
@@ -447,76 +458,40 @@ class MediaBackend {
     }
 }
 
-class MediaInfo {
-    private readonly qualityLevels: Map<string, QualityLevel>;
-    readonly rawIFrames: Float64Array;
-    readonly breakpoints: Float64Array;
+abstract class MediaInfo {
+    readonly outDir: string;
+    private outDirPromise?: Promise<void>;
 
-    private constructor(
-        readonly parent: HlsVod, 
-        readonly relPath: string,
-        readonly outDir: string,
-        readonly ffProbeResult: string
-    ) { 
-        const ffprobeOutput = JSON.parse(ffProbeResult);
-        const { width, height, duration } = ffprobeOutput['streams'][0];
-        assert(duration > 0.5, 'Video too short.');
-		
-		const resolution = Math.min(width, height);
-        this.rawIFrames = Float64Array.from(ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter((time: number) => !isNaN(time)));
-        
-		this.breakpoints = MediaInfo.convertToSegments(this.rawIFrames, duration);
-        
-        const presets = qualityLevelPresets.filter(preset => preset.resolution <= resolution);
-        this.qualityLevels = new Map((presets.length ? presets : [qualityLevelPresets[qualityLevelPresets.length - 1]]).map(preset => 
-            [preset.name, {
-                preset,
-                width: Math.round(width / resolution * preset.resolution),
-                height: Math.round(height / resolution * preset.resolution),
-                backend: null
-            }]
-        )); 
-
-        this.log(`Video information initialized. Using output directory ${outDir}.`);
-    }
-
-    public static async getInstance(
-        parent: HlsVod, 
-        relPath: string
-    ): Promise<MediaInfo> {
-        const ffprobeOutput = await (parent.exec('ffprobe', [
-			'-v', 'error', // Hide debug information
-			'-show_streams', // Show video dimensions
-			'-skip_frame', 'nokey', '-show_entries', 'frame=pkt_pts_time', // List all I frames
-			'-select_streams', 'v', // Video stream only, we're not interested in audio
-            '-of', 'json',
-            parent.toDiskPath(relPath)
-        ], { timeout: ffprobeTimeout })).result();
-        
+    constructor(readonly parent: HlsVod, readonly relPath: string, readonly breakpoints: Float64Array) {
 		const pathHash = crypto.createHash('md5').update(parent.toDiskPath(relPath)).digest('hex');
-        const outDir = path.join(parent.outputPath, pathHash);
-        await fsExtra.mkdirs(outDir);
-
-        return new MediaInfo(parent, relPath, outDir, ffprobeOutput);
+        this.outDir = path.join(parent.outputPath, pathHash);
+        this.outDirPromise = fsExtra.mkdirs(this.outDir);
     }
 
-    getMasterManifest(): string {
-        return ['#EXTM3U'].concat(
-            ...Array.from(this.qualityLevels.entries()).map(([levelName, { width, height, preset }]) => [
-                `#EXT-X-STREAM-INF:BANDWIDTH=${
-                    Math.ceil((preset.videoBitrate + preset.audioBitrate) * 1.05) // 5% estimated container overhead.
-                },RESOLUTION=${width}x${height},NAME=${levelName}`,
-                `quality-${levelName}.m3u8`
-            ])
-        ).join(os.EOL)
+    static async getInstance(parent: HlsVod, key: string): Promise<MediaInfo> {
+        const type = key.charAt(0);
+        const path = key.substr(1);
+        let instance;
+        if (type === 'V') {
+            instance = await VideoInfo.getInstance(parent, path);
+        } else if (type === 'A') {
+            instance = await AudioInfo.getInstance(parent, path);
+        } else {
+            throw new RangeError('Bad media type.');
+        }
+        await instance.outDirPromise!;
+        delete instance.outDirPromise;
+        return instance;
+    }
+ 
+    log(...params: any): void {
+        if (this.parent.debug) {
+            console.log(`[${this.relPath}]`, ...params);
+        }
     }
     
-    level(qualityLevel: string): MediaBackend {
-        const level = this.qualityLevels.get(qualityLevel);
-        assert(level, 'Quality level not exists.');
-        if (!level.backend) { level.backend = new MediaBackend(this, level); }
-        return level.backend;
-    }
+    abstract getMasterManifest(): string;
+    abstract destruct(): Promise<void>;
 
     /**
 	 * Calculate the timestamps to segment the video at. 
@@ -529,7 +504,7 @@ class MediaInfo {
 	 * 
 	 * This guarantees that all segments are between the duration 2.33 s and 4.75 s.
 	 */
-	private static convertToSegments(rawTimeList: Float64Array, duration: number): Float64Array {
+	protected static convertToSegments(rawTimeList: Float64Array, duration: number): Float64Array {
 		const timeList = [...rawTimeList, duration];
 		const segmentStartTimes = [0];
 		let lastTime = 0;
@@ -561,6 +536,74 @@ class MediaInfo {
 		segmentStartTimes.push(duration);
 		return Float64Array.from(segmentStartTimes);
     }
+}
+
+class VideoInfo extends MediaInfo {
+    private readonly qualityLevels: Map<string, QualityLevel>;
+
+    private constructor(
+        parent: HlsVod, 
+        relPath: string,
+        ffProbeResult: string
+    ) { 
+        const ffprobeOutput = JSON.parse(ffProbeResult);
+
+        const duration = parseFloat(ffprobeOutput['streams'][0]['duration']) || parseFloat(ffprobeOutput['format']['duration']);
+        assert(duration > 0.5, 'Video too short.');
+		
+        const { width, height } = ffprobeOutput['streams'][0];
+		const resolution = Math.min(width, height);
+        const rawIFrames = Float64Array.from(ffprobeOutput['frames'].map((frame: Record<string, string>) => parseFloat(frame['pkt_pts_time'])).filter((time: number) => !isNaN(time)));
+        
+        super(parent, relPath, MediaInfo.convertToSegments(rawIFrames, duration));
+        
+        const presets = qualityLevelPresets.filter(preset => preset.resolution <= resolution);
+        this.qualityLevels = new Map((presets.length ? presets : [qualityLevelPresets[qualityLevelPresets.length - 1]]).map(preset => 
+            [preset.name, {
+                preset,
+                width: Math.round(width / resolution * preset.resolution),
+                height: Math.round(height / resolution * preset.resolution),
+                backend: null
+            }]
+        )); 
+
+        this.log(`Video information initialized. Using output directory ${this.outDir}.`);
+    }
+
+    static async getInstance(
+        parent: HlsVod, 
+        relPath: string
+    ): Promise<VideoInfo> {
+        const ffprobeOutput = await (parent.exec('ffprobe', [
+			'-v', 'error', // Hide debug information
+            '-skip_frame', 'nokey', '-show_entries', 'frame=pkt_pts_time', // List all I frames
+            '-show_entries', 'format=duration',
+            '-show_entries', 'stream=duration,width,height',
+			'-select_streams', 'v', // Video stream only, we're not interested in audio
+            '-of', 'json',
+            parent.toDiskPath(relPath)
+        ], { timeout: ffprobeTimeout })).result();
+
+        return new VideoInfo(parent, relPath, ffprobeOutput);
+    }
+
+    getMasterManifest(): string {
+        return ['#EXTM3U'].concat(
+            ...Array.from(this.qualityLevels.entries()).map(([levelName, { width, height, preset }]) => [
+                `#EXT-X-STREAM-INF:BANDWIDTH=${
+                    Math.ceil((preset.videoBitrate + preset.audioBitrate) * 1.05) // 5% estimated container overhead.
+                },RESOLUTION=${width}x${height},NAME=${levelName}`,
+                `quality-${levelName}.m3u8`
+            ])
+        ).join(os.EOL)
+    }
+    
+    level(qualityLevel: string): MediaBackend {
+        const level = this.qualityLevels.get(qualityLevel);
+        assert(level, 'Quality level not exists.');
+        if (!level.backend) { new MediaBackend(this, level); }
+        return level.backend!;
+    }
 
     async destruct() {
         // Caller should ensure that the instance is already initialized.
@@ -569,11 +612,52 @@ class MediaInfo {
         }
         await fsExtra.remove(this.outDir);
     }
+}
+
+class AudioInfo extends MediaInfo {
+    readonly backend: MediaBackend;
+
+    private constructor(
+        parent: HlsVod, 
+        relPath: string,
+        ffProbeResult: string
+    ) { 
+        const ffprobeOutput = JSON.parse(ffProbeResult);
+
+        const duration = parseFloat(ffprobeOutput['streams'][0]['duration']) || parseFloat(ffprobeOutput['format']['duration']);
+        assert(duration > 0.5, 'Video too short.');
+        
+        super(parent, relPath, MediaInfo.convertToSegments(Float64Array.of(), duration));
+
+        this.log(`Audio information initialized. Using output directory ${this.outDir}.`);
+        
+        this.backend = new MediaBackend(this, {
+            width: 0, height: 0, preset: audioPreset, backend: null
+        });
+    }
+
+    getMasterManifest(): string {
+        return this.backend.getVariantManifest();
+    }
+
+    static async getInstance(
+        parent: HlsVod, 
+        relPath: string
+    ): Promise<AudioInfo> {
+        const ffprobeOutput = await (parent.exec('ffprobe', [
+			'-v', 'error', // Hide debug information
+            '-show_entries', 'stream=duration,bit_rate',
+			'-select_streams', 'a', // Video stream only, we're not interested in audio
+            '-of', 'json',
+            parent.toDiskPath(relPath)
+        ], { timeout: ffprobeTimeout })).result();
     
-    log(...params: any): void {
-        if (this.parent.debug) {
-            console.log(`[${this.relPath}]`, ...params);
-        }
+        return new AudioInfo(parent, relPath, ffprobeOutput);
+    }
+
+    async destruct() {
+        await this.backend.destruct();
+        await fsExtra.remove(this.outDir);
     }
 }
 
@@ -655,7 +739,7 @@ class HlsVod {
     private readonly maxClientNumber: number;
     private readonly cachedMedia = new LruCacheMapForAsync<string, MediaInfo>(
         Math.max(20), 
-        relPath => MediaInfo.getInstance(this, relPath),
+        typeAndPath => MediaInfo.getInstance(this, typeAndPath),
         info => info.destruct()
     );
     private readonly clientTracker: Map<string, Promise<MediaBackend>> = new Map();
@@ -679,6 +763,9 @@ class HlsVod {
         args: string[],
         { timeout, cwd } : { timeout?: number, cwd?: string } = {}
     ): SubProcessInvocation {
+        if (this.debug) {
+            console.log(`Running ${command} ${args.join(' ')}`);
+        }
         const handle = new SubProcessInvocation(this.ffmpegBinaryDir + command, args, cwd || this.outputPath, timeout || processCleanupTimeout);
         const started = Date.now();
         this.allSubProcesses.add(handle);
@@ -704,8 +791,9 @@ class HlsVod {
         }));
     }
 
-    private getBackend(clientId: string, file: string, qualityLevel: string): Promise<MediaBackend> {
+    private getBackend(clientId: string, type: string, file: string, qualityLevel: string): Promise<MediaBackend> {
         const existing = this.clientTracker.get(clientId);
+        this.clientTracker.delete(clientId);
         if (!existing) { // New client.
             if (this.clientTracker.size > this.maxClientNumber) {
                 const [victimKey, victimValue] = this.clientTracker.entries().next().value;
@@ -718,14 +806,18 @@ class HlsVod {
                     backend.removeClient(clientId);
                 }
             });
-            this.clientTracker.delete(clientId);
         }
-        const newLookupPromise = this.cachedMedia.get(file).then(instance => instance.level(qualityLevel));
+        const newLookupPromise = this.cachedMedia.get(type + file).then(instance => 
+            (qualityLevel === audioPreset.name) ? (instance as AudioInfo).backend : ((instance as VideoInfo).level(qualityLevel))
+        );
         this.clientTracker.set(clientId, newLookupPromise);
         return newLookupPromise;
     }
 
     private async removeClient(clientId: string): Promise<void> {
+        if (this.debug) {
+            console.log(`Client ${clientId} unregistering...`);
+        }
         const existing = this.clientTracker.get(clientId);
         if (!existing) { return; }
         existing.then(backend => backend.removeClient(clientId));
@@ -764,18 +856,19 @@ class HlsVod {
         const probeResult = JSON.parse(await (this.exec('ffprobe', [
             '-v', 'error', // Hide debug information
             '-show_entries', 'stream=duration', // Show duration
+            '-show_entries', 'format=duration', // Show duration
             '-select_streams', 'v', // Video stream only, we're not interested in audio
             '-of', 'json',
             fsPath
         ], { timeout: ffprobeTimeout })).result());
 
-        const duration = parseFloat(probeResult['streams'][0]['duration']);
+        const duration = parseFloat(probeResult['streams'][0]['duration']) || parseFloat(probeResult['format']['duration']);
         assert(!isNaN(duration));
 
         const vf = `fps=1/${(duration / numOfFrames)}`;
 
         const encoderChild = this.exec('ffmpeg', ['-i', fsPath, '-vf', `${vf},scale=${singleWidth}:-2${onePiece ? `,tile=${xCount}x${yCount}` : ''}'`, '-f', 'image2pipe', ...(onePiece ? ['-vframes', '1'] : ''), '-'], {
-            timeout: 45 * 1000
+            timeout: 60 * 1000
 		});
 
 		encoderChild.stdout.pipe(response);
@@ -783,40 +876,34 @@ class HlsVod {
         request.on('close', encoderChild.kill);
     }
 
-    // TODO: Legacy method. Will improve later.
-    // Problem: some clients interrupt the HTTP request and send a new one, causing the song to restart...
-    private handleAudioRequest(relPath: string, request: express.Request, response: express.Response): void {
-        var filePath = this.toDiskPath(relPath);
-
-        // TODO: Child management
-        //var encoderChild = childProcess.spawn(transcoderPath, ['-i', filePath, '-b:a', 64 + 'k', '-ac', '2', '-acodec', 'libaacplus', '-threads', '0', '-f', 'adts', '-']);
-        const encoderChild = this.exec('ffmpeg', [
-            '-i', filePath, '-threads', '0',
-            '-b:a', 192 + 'k', '-ac', '2', '-acodec', 'libmp3lame',
-            '-map', '0:a:0',
-            '-f', 'mp3', '-'
-        ]);
-
-		encoderChild.stdout.pipe(response);
-        response.writeHead(200, {'Content-Type': 'audio/mpeg'});
-        request.on('close', encoderChild.kill);
+    // An album art in a MP3 may be identified as a video stream. We need to exclude that to prevent MP3s being identified as videos.
+    private static isId3Image(stream: { disposition?: Record<string, number> }): boolean {
+        return !!(stream.disposition?.attached_pic);
     }
 
-    private async handleVideoInitializationRequest(filePath: string): Promise<{ error: string } | { maybeNativelySupported: boolean, bufferLength: number }> {
-        const probeResult = JSON.parse(await (this.exec('ffprobe', [
-            '-v', 'error', // Hide debug information
-            '-show_format', // Show container information
-            '-show_streams', // Show codec information
-            '-of', 'json',
-            this.toDiskPath(filePath)
-        ], { timeout: ffprobeTimeout })).result());
-
+    private async handleInitializationRequest(filePath: string): Promise<{ error: string } | { maybeNativelySupported: boolean, type: 'video' | 'audio', bufferLength: number }> {
         try {
+            const probeResult = JSON.parse(await (this.exec('ffprobe', [
+                '-v', 'error', // Hide debug information
+                '-show_format', // Show container information
+                '-show_streams', // Show codec information
+                '-of', 'json',
+                this.toDiskPath(filePath)
+            ], { timeout: ffprobeTimeout })).result());
             const format = probeResult['format']['format_name'].split(',')[0];
             const audioStream = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'audio');
-            const videoCodec = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'video')['codec_name'];
+            const videoStream = probeResult['streams'].find((stream: Record<string, string>) => stream['codec_type'] === 'video' && !HlsVod.isId3Image(stream));
+            const duration = (videoStream ? parseFloat(videoStream['duration']) : 0) || (audioStream ? parseFloat(audioStream['duration']) : 0) || parseFloat(probeResult['format']['duration']);
+
+            const isVideo = !!videoStream && (duration > 0.5);
+            if (!isVideo) { assert(!!audioStream, 'Neither video or audio stream is found.'); }
             return {
-                maybeNativelySupported: (nativeSupportedFormats.container.includes(format) && (!audioStream || nativeSupportedFormats.audio.includes(audioStream['codec_name'])) && nativeSupportedFormats.video.includes(videoCodec)) && !this.noShortCircuit,
+                type: isVideo ? 'video' : 'audio',
+                maybeNativelySupported: 
+                    !this.noShortCircuit
+                    && ((isVideo ? nativeSupportedFormats.videoContainer : nativeSupportedFormats.audioContainer).includes(format))
+                    && (!audioStream || nativeSupportedFormats.audioCodec.includes(audioStream['codec_name'])) 
+                    && (!videoStream || nativeSupportedFormats.videoCodec.includes(videoStream['codec_name'])),
                 bufferLength: this.videoMinBufferLength
             };
         } catch (e) {
@@ -830,6 +917,8 @@ class HlsVod {
         const defaultCatch = (response: express.Response) => (error: Error) => response.status(500).send(error.stack || error.toString());
 
         const respond = (response: express.Response, promise: Promise<string | Buffer | Object>): Promise<unknown> => promise.then(result => (((typeof result === 'string') || Buffer.isBuffer(result)) ? response.send(result) : response.json(result))).catch(defaultCatch(response));
+
+        const ensureType = (typeStr: string) => (typeStr === 'video') ? 'V' : (assert.strictEqual(typeStr, 'audio'), 'A');
         
         const app = express();
         app.set('query parser', 'simple');
@@ -840,21 +929,21 @@ class HlsVod {
 
         app.use('/node_modules', serveStatic(path.join(__dirname, 'node_modules')));
 
-        app.get('/video/:file', (request, response) => {
-            respond(response, this.handleVideoInitializationRequest(request.params['file']));
+        app.get('/media/:file', (request, response) => {
+            respond(response, this.handleInitializationRequest(request.params['file']));
         });
 
         // m3u8 file has to be under the same path as the TS-files, so they can be linked relatively in the m3u8 file
-        app.get('/hls.:client/:file/master.m3u8', (request, response) => {
-            respond(response, this.cachedMedia.get(request.params['file']).then(media => media.getMasterManifest()));
+        app.get('/:type.:client/:file/master.m3u8', (request, response) => {
+            respond(response, this.cachedMedia.get(ensureType(request.params['type']) + request.params['file']).then(media => media.getMasterManifest()));
 		});
 		
-        app.get('/hls.:client/:file/quality-:quality.m3u8', (request, response) => {
-            respond(response, this.getBackend(request.params['client'], request.params['file'], request.params['quality']).then(backend => backend.getVariantManifest()));
+        app.get('/:type.:client/:file/quality-:quality.m3u8', (request, response) => {
+            respond(response, this.getBackend(request.params['client'], ensureType(request.params['type']), request.params['file'], request.params['quality']).then(backend => backend.getVariantManifest()));
 		});
 
-        app.get('/hls.:client/:file/:quality.:segment.ts', (request, response) => {
-            this.getBackend(request.params['client'], request.params['file'], request.params['quality']).then(media => 
+        app.get('/:type.:client/:file/:quality.:segment.ts', (request, response) => {
+            this.getBackend(request.params['client'], ensureType(request.params['type']), request.params['file'], request.params['quality']).then(media => 
                 media.getSegment(request.params['client'], request.params['segment'], request, response)
             ).catch(defaultCatch);
         });
@@ -876,13 +965,7 @@ class HlsVod {
             const singleWidth = parseInt(request.query['width'] as string);
             const onePiece = !!parseInt(request.query['one'] as string);
             assert(!isNaN(x) && !isNaN(y));
-            // Legacy feature inherited from hls-vod. Maybe drop the feature?
             this.handleThumbnailRequest(request.params['file'], x, y, singleWidth, onePiece, request, response);
-        });
-
-        app.get('/audio/:file', (request, response) => {
-            // Legacy feature inherited from hls-vod. Maybe drop the feature?
-            this.handleAudioRequest(request.params['file'], request, response);
         });
 
         return server;
