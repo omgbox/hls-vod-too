@@ -995,7 +995,7 @@ class HlsVod {
     }
 }
 
-if (require.main === module) {
+if ((require.main === module) || (require.main?.filename === path.join(__dirname, 'hls-vod-too.js'))) {
     const exitWithUsage = (argv: string[]) => {
         console.log(
             'Usage: ' + argv[0] + ' ' + argv[1]
