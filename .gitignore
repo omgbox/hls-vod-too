@@ -2,3 +2,5 @@ cache
 node_modules
 .DS_Store
 .idea
+# hls-vod.js is built from the TypeScript source. No need to include in repo.
+hls-vod.js

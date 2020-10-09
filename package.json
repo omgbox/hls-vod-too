@@ -1,11 +1,8 @@
 {
   "name": "hls-vod-too",
-  "version": "2.0.1",
+  "version": "2.0.3",
   "description": "Node CLI for on-demand encoding and streaming of videos",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/mifi/hls-vod.git"
-  },
+  "repository": "github:kmxz/hls-vod-too",
   "contributors": [
     {
       "name": "Mikael Finstad",
@@ -15,15 +12,15 @@
   ],
   "license": "MIT",
   "files": [
-    "hls-vod.ts",
-    "hls-vod-too.js",
+    "hls-vod.js",
     "static"
   ],
   "scripts": {
-    "start": "ts-node hls-vod.ts"
+    "start": "ts-node hls-vod.ts",
+    "prepare": "tsc && shebang-trim hls-vod.js"
   },
   "bin": {
-    "hls-vod-too": "hls-vod-too.js"
+    "hls-vod-too": "hls-vod.js"
   },
   "engines": {
     "node": ">=10.12"
@@ -34,8 +31,7 @@
     "fs-extra": "^9.0.1",
     "hls.js": "^0.14.13",
     "minimist": "^1.2.0",
-    "serve-static": "^1.13.5",
-    "socket.io": "^2.1.11"
+    "serve-static": "^1.13.5"
   },
   "devDependencies": {
     "@types/express": "^4.17.8",
@@ -44,6 +40,7 @@
     "@types/node": "^14.11.2",
     "@types/serve-static": "^1.13.5",
     "@types/socket.io": "^2.1.11",
+    "shebang-trim": "^1.0.0",
     "ts-node": "^9.0.0",
     "typescript": "^4.0.3"
   }

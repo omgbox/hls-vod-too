@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node-script
+#!/usr/bin/env ts-node
 
 import assert = require('assert');
 import childProcess = require('child_process');
@@ -995,7 +995,7 @@ class HlsVod {
     }
 }
 
-if ((require.main === module) || (require.main?.filename === path.join(__dirname, 'hls-vod-too.js'))) {
+if (require.main === module) {
     const exitWithUsage = (argv: string[]) => {
         console.log(
             'Usage: ' + argv[0] + ' ' + argv[1]
